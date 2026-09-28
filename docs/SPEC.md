@@ -48,7 +48,7 @@ $ echo '{"v":1,"id":1,"device":"sys/tg/1","op":"DeviceName"}' | nc localhost 100
 | `v`      | Version Protocol  | u32                         | yes      | Protocol version, MUST be `1`. |
 | `id`     | Request ID        | u64                         | yes      | Chosen by the client, echoed in the reply. |
 | `client` | Client ID         | u64                         | no (0)   | Identifies the client process (recorded in the black box). |
-| `source` | Source            | `"Dev"`\|`"Cache"`\|`"CacheDev"` | no (`Dev`) | Data source (see §5). |
+| `source` | Source            | `"DEV"`\|`"CACHE"`\|`"CACHE_DEV"` | no (`DEV`) | Data source (see §5). |
 | `device` | —                 | string                      | yes      | Target device name `domain/family/member`. Needed because one socket serves many devices (in CORBA the object reference carried it). |
 | `op`     | Request Type + Payload | `Op`                   | yes      | The operation (see §3). |
 
@@ -60,13 +60,15 @@ $ echo '{"v":1,"id":1,"device":"sys/tg/1","op":"DeviceName"}' | nc localhost 100
 | `reply` | Payload           | `{"Ok": Data}` \| `{"Err": DevFailed}` | Result of the operation. |
 
 `DevFailed` (RFC-9 Exceptions) is a non-empty array of
-`{"reason", "desc", "origin", "severity": "Warn"|"Err"|"Panic"}`.
+`{"reason", "desc", "origin", "severity": "WARN"|"ERR"|"PANIC"}`.
 
 ### 2.3 Encoding conventions
 
 Rust `serde` external tagging is used everywhere: a unit variant is a bare
 string (`"DevicePing"`), a variant with data is a one-key object
 (`{"Double": 3.14}`, `{"CommandInfo": {"name": "DevDouble"}}`).
+Tango enumerations use their Tango spelling: `"ON"`, `"SCALAR"`, `"READ_WRITE"`,
+`"VALID"`, `"OPERATOR"`, `"CACHE_DEV"`, `"ERR"`.
 
 ## 3. Operations
 
@@ -138,7 +140,7 @@ Command (RFC-3):
 
 Attribute (RFC-4):
 * `AttrInfo` = static metadata `{name, data_type, data_format
-  (Scalar|Spectrum|Image), writable (Read|Write|ReadWrite|ReadWithWrite),
+  (SCALAR|SPECTRUM|IMAGE), writable (READ|WRITE|READ_WRITE|READ_WITH_WRITE),
   max_dim_x, max_dim_y, disp_level}` + properties `{description, label, unit,
   format, min_value, max_value, min_alarm, max_alarm, min_warning,
   max_warning}` (numbers or `null` = "Not specified").
@@ -153,7 +155,7 @@ Attribute (RFC-4):
 * **ATTRIBUTES READ** never fails as a whole for an attribute problem; each
   element carries its own result (`API_AttrNotFound`, device error, …).
 * **ATTRIBUTES WRITE**: each value is checked then written in order:
-  not `Write`/`ReadWrite` → `API_AttrNotWritable`; wrong type →
+  not `WRITE`/`READ_WRITE` → `API_AttrNotWritable`; wrong type →
   `API_IncompatibleAttrDataType`; numeric element outside
   `[min_value, max_value]` → `API_WAttrOutsideLimit`. Successful writes are
   kept; all errors are aggregated in one `DevFailed`.
@@ -202,7 +204,8 @@ payload. `DevEnum` is transported as `Short` (RFC-9).
 ## 5. Polling, history and data source
 
 * The server MAY poll attributes and Void-input commands at a fixed period
-  (server configuration). Each poll result (value or error) is stored in a
+  (server configuration). As in Tango, the object kind (attribute or command)
+  is given explicitly since an attribute and a command may share a name. Each poll result (value or error) is stored in a
   ring buffer of depth 10 (Tango `poll_ring_depth` default).
 * **COMMAND/ATTRIBUTE HISTORY** returns the `min(n, stored, depth)` most
   recent entries, newest first: `CmdHistory = {time, value: {"Ok": Value} |
@@ -210,8 +213,8 @@ payload. `DevEnum` is transported as `Short` (RFC-9).
   {"Err": DevFailed}}`. Not polled → `API_CmdNotPolled` /
   `API_AttrNotPolled`.
 * `source` applies to COMMAND EXECUTION and ATTRIBUTES READ:
-  `Dev` = always the device; `Cache` = last polled result, not polled →
-  `API_CmdNotPolled`/`API_AttrNotPolled`; `CacheDev` = cache if polled,
+  `DEV` = always the device; `CACHE` = last polled result, not polled →
+  `API_CmdNotPolled`/`API_AttrNotPolled`; `CACHE_DEV` = cache if polled,
   device otherwise.
 
 Time is a `f64` number of seconds since the Unix epoch.

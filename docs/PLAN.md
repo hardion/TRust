@@ -46,7 +46,7 @@ pub trait Device: Send + 'static {
     fn pipes(&self) -> Vec<PipeInfo> { vec![] }
     fn init(&mut self) -> DevResult<()> { Ok(()) }
     fn state(&mut self) -> DevState { DevState::Unknown }
-    fn status(&mut self) -> String { /* "The device is in X state." */ }
+    fn status(&mut self) -> Option<String> { None } // None: "The device is in X state."
     fn execute(&mut self, cmd: &str, arg: Value) -> DevResult<Value>;
     fn read_attribute(&mut self, attr: &str) -> DevResult<Value>;
     fn write_attribute(&mut self, attr: &str, v: Value) -> DevResult<()>;
@@ -56,7 +56,8 @@ pub trait Device: Send + 'static {
 
 Server::new("TgTest", "test")
     .device("sys/tg/1", TgTest::default())
-    .poll("sys/tg/1", "double_scalar", Duration::from_millis(50))
+    .poll_attribute("sys/tg/1", "counter", Duration::from_millis(50))
+    .poll_command("sys/tg/1", "Counter", Duration::from_millis(50))
     .run(listener).await?;
 
 // client side

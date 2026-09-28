@@ -2,8 +2,8 @@
 
 mod common;
 
-use common::{start, DEV, POLL};
-use serde_json::{json, Value as Json};
+use common::{DEV, POLL, start};
+use serde_json::{Value as Json, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use trust::*;
@@ -81,7 +81,10 @@ async fn admin_device() {
     let mut admin = DeviceProxy::connect(&format!("{addr}/{adm}")).await.unwrap();
     assert_eq!(admin.adm_name().await.unwrap(), adm);
     assert_eq!(admin.info().await.unwrap().dev_class, "DServer");
-    assert_eq!(admin.command_inout("QueryClass", Value::Void).await.unwrap(), Value::StringArray(vec!["TgTest".into()]));
+    assert_eq!(
+        admin.command_inout("QueryClass", Value::Void).await.unwrap(),
+        Value::StringArray(vec!["TgTest".into()])
+    );
     assert_eq!(
         admin.command_inout("QueryDevice", Value::Void).await.unwrap(),
         Value::StringArray(vec![format!("TgTest::{DEV}")])
@@ -94,7 +97,7 @@ async fn admin_device() {
 async fn command_execution() {
     let mut dev = proxy().await;
     assert_eq!(dev.command_inout("DevVoid", Value::Void).await.unwrap(), Value::Void);
-    assert_eq!(dev.command_inout("DevDouble", Value::Double(3.14)).await.unwrap(), Value::Double(3.14));
+    assert_eq!(dev.command_inout("DevDouble", Value::Double(1.25)).await.unwrap(), Value::Double(1.25));
     assert_eq!(dev.command_inout("DevString", Value::String("hi".into())).await.unwrap(), Value::String("hi".into()));
     let longs = Value::LongArray(vec![1, -2, 3]);
     assert_eq!(dev.command_inout("DevVarLongArray", longs.clone()).await.unwrap(), longs);
@@ -156,7 +159,8 @@ async fn command_history() {
 #[tokio::test]
 async fn read_attributes() {
     let mut dev = proxy().await;
-    let values = dev.read_attributes(&["State", "Status", "long_spectrum", "short_image", "nope", "faulty"]).await.unwrap();
+    let values =
+        dev.read_attributes(&["State", "Status", "long_spectrum", "short_image", "nope", "faulty"]).await.unwrap();
     assert_eq!(values.len(), 6);
     let v = |i: usize| values[i].as_ref().unwrap();
     assert_eq!(v(0).value, Value::State(DevState::On));
@@ -188,13 +192,32 @@ async fn write_errors() {
     let mut dev = proxy().await;
     let reason = |e: DevFailed| e.reason().to_owned();
     let w = |name: &'static str, v: Value| (name, v);
-    assert_eq!(reason(dev.write_attribute("long_spectrum", Value::LongArray(vec![1])).await.unwrap_err()), "API_AttrNotWritable");
-    assert_eq!(reason(dev.write_attribute("State", Value::State(DevState::Off)).await.unwrap_err()), "API_AttrNotWritable");
-    assert_eq!(reason(dev.write_attribute("double_scalar", Value::Long(1)).await.unwrap_err()), "API_IncompatibleAttrDataType");
-    assert_eq!(reason(dev.write_attribute("double_scalar", Value::Double(1e3)).await.unwrap_err()), "API_WAttrOutsideLimit");
+    assert_eq!(
+        reason(dev.write_attribute("long_spectrum", Value::LongArray(vec![1])).await.unwrap_err()),
+        "API_AttrNotWritable"
+    );
+    assert_eq!(
+        reason(dev.write_attribute("State", Value::State(DevState::Off)).await.unwrap_err()),
+        "API_AttrNotWritable"
+    );
+    assert_eq!(
+        reason(dev.write_attribute("double_scalar", Value::Long(1)).await.unwrap_err()),
+        "API_IncompatibleAttrDataType"
+    );
+    assert_eq!(
+        reason(dev.write_attribute("double_scalar", Value::Double(1e3)).await.unwrap_err()),
+        "API_WAttrOutsideLimit"
+    );
     assert_eq!(reason(dev.write_attribute("nope", Value::Double(1.0)).await.unwrap_err()), "API_AttrNotFound");
     // errors are aggregated, valid writes are applied
-    let err = dev.write_attributes(&[w("nope", Value::Void), w("double_scalar", Value::Double(7.0)), w("long_spectrum", Value::Void)]).await.unwrap_err();
+    let err = dev
+        .write_attributes(&[
+            w("nope", Value::Void),
+            w("double_scalar", Value::Double(7.0)),
+            w("long_spectrum", Value::Void),
+        ])
+        .await
+        .unwrap_err();
     assert_eq!(err.0.len(), 2);
     assert_eq!(dev.read_attribute("double_scalar").await.unwrap().value, Value::Double(7.0));
 }
@@ -202,7 +225,10 @@ async fn write_errors() {
 #[tokio::test]
 async fn write_read_attributes() {
     let mut dev = proxy().await;
-    let values = dev.write_read_attributes(&[("double_scalar", Value::Double(-3.0))], &["double_scalar", "long_spectrum"]).await.unwrap();
+    let values = dev
+        .write_read_attributes(&[("double_scalar", Value::Double(-3.0))], &["double_scalar", "long_spectrum"])
+        .await
+        .unwrap();
     assert_eq!(values[0].as_ref().unwrap().value, Value::Double(-3.0));
     assert_eq!(values[1].as_ref().unwrap().value, Value::LongArray(vec![1, 2, 3]));
     let err = dev.write_read_attributes(&[("long_spectrum", Value::Void)], &["double_scalar"]).await.unwrap_err();
@@ -233,7 +259,10 @@ async fn attribute_get_config() {
         assert!(names.contains(&n), "{n} missing in {names:?}");
     }
     let [ds, state] = &dev.get_attribute_config(&["double_scalar", "State"]).await.unwrap()[..] else { panic!() };
-    assert_eq!((ds.data_type, ds.data_format, ds.writable), (DataType::Double, DataFormat::Scalar, Writable::ReadWrite));
+    assert_eq!(
+        (ds.data_type, ds.data_format, ds.writable),
+        (DataType::Double, DataFormat::Scalar, Writable::ReadWrite)
+    );
     assert_eq!((ds.unit.as_str(), ds.max_alarm), ("mm", Some(50.0)));
     assert_eq!((state.data_type, state.writable), (DataType::State, Writable::Read));
     assert_eq!(dev.get_attribute_config(&["nope"]).await.unwrap_err().reason(), "API_AttrNotFound");
@@ -332,7 +361,8 @@ async fn pipe_config() {
 
 async fn raw(addr: &str, lines: &[Json]) -> Vec<Json> {
     let mut stream = TcpStream::connect(addr).await.unwrap();
-    let payload: String = lines.iter().map(|l| if let Json::String(s) = l { format!("{s}\n") } else { format!("{l}\n") }).collect();
+    let payload: String =
+        lines.iter().map(|l| if let Json::String(s) = l { format!("{s}\n") } else { format!("{l}\n") }).collect();
     stream.write_all(payload.as_bytes()).await.unwrap();
     let mut reader = BufReader::new(stream).lines();
     let mut out = vec![];

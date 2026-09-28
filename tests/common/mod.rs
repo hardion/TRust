@@ -4,8 +4,8 @@
 use std::time::Duration;
 use tokio::net::TcpListener;
 use trust::{
-    AttrInfo, CmdInfo, DataFormat as F, DataType as T, DevFailed, DevResult, DevState, Device,
-    PipeBlob, PipeInfo, Server, Value, Writable as W,
+    AttrInfo, CmdInfo, DataFormat as F, DataType as T, DevFailed, DevResult, DevState, Device, PipeBlob, PipeInfo,
+    Server, Value, Writable as W,
 };
 
 pub const DEV: &str = "sys/tg/1";
@@ -20,10 +20,8 @@ pub struct TgTest {
 
 impl Default for TgTest {
     fn default() -> Self {
-        let elements = vec![
-            ("x".into(), Value::Double(1.0)),
-            ("names".into(), Value::StringArray(vec!["a".into(), "b".into()])),
-        ];
+        let elements =
+            vec![("x".into(), Value::Double(1.0)), ("names".into(), Value::StringArray(vec!["a".into(), "b".into()]))];
         Self { double: 0.0, string: String::new(), counter: 0, blob: PipeBlob { name: "data".into(), elements } }
     }
 }
@@ -100,7 +98,9 @@ impl Device for TgTest {
                 self.counter += 1;
                 Value::Long(self.counter)
             }
-            _ => return Err(DevFailed::new("TG_ReadFailed", "hardware not responding", "TgTest::faulty")),
+            _ => {
+                return Err(DevFailed::new("TG_ReadFailed", "hardware not responding", "TgTest::faulty"));
+            }
         })
     }
     fn write_attribute(&mut self, attr: &str, value: Value) -> DevResult<()> {
@@ -126,9 +126,9 @@ impl Device for TgTest {
 pub fn server() -> Server {
     Server::new("TgTest", "test")
         .device(DEV, TgTest::default())
-        .poll(DEV, "counter", POLL)
-        .poll(DEV, "faulty", POLL)
-        .poll(DEV, "Counter", POLL)
+        .poll_attribute(DEV, "counter", POLL)
+        .poll_attribute(DEV, "faulty", POLL)
+        .poll_command(DEV, "Counter", POLL)
 }
 
 /// Starts a server on a random port and returns its address.
