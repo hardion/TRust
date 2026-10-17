@@ -410,14 +410,19 @@ impl Handler {
     /// `peer` identifies the client in the black box.
     pub fn frame(&self, frame: &[u8], peer: &str) -> Vec<u8> {
         let reply = match serde_json::from_slice::<Request>(frame) {
-            Ok(req) => Reply { id: req.id, reply: self.0.handle(req, peer) },
+            Ok(req) => self.call(req, peer),
             Err(e) => Reply { id: 0, reply: Err(e.into()) },
         };
         serde_json::to_vec(&reply).expect("a reply is always serialisable")
     }
+
+    /// Typed entry point, for transports that carry the envelope themselves.
+    pub fn call(&self, req: Request, peer: &str) -> Reply {
+        Reply { id: req.id, reply: self.0.handle(req, peer) }
+    }
 }
 
-/// A device server (RFC-8): hosts devices on one TCP port.
+/// A device server (RFC-8): hosts devices on one gRPC endpoint.
 pub struct Server {
     exec: String,
     instance: String,
@@ -447,10 +452,10 @@ impl Server {
         self
     }
 
-    /// Serves the devices over TCP (JSON Lines) forever.
+    /// Serves the devices as the gRPC service `tango.v1.Device` forever.
     pub async fn run(self, listener: TcpListener) -> DevResult<()> {
         let handler = self.start(&listener.local_addr()?.ip().to_string())?;
-        crate::tcp::serve(listener, handler).await
+        crate::grpc::serve(listener, handler).await
     }
 
     /// Initialises and exports the devices, starts polling and returns the request handler.

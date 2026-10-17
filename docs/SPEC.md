@@ -1,4 +1,4 @@
-# TRust — Tango Request-Reply over a simple socket protocol
+# TRust — Tango Request-Reply over gRPC
 
 Status: **Draft / Proof of Concept** — protocol version `1`.
 
@@ -6,7 +6,7 @@ TRust implements the Tango device model as defined by the
 [Tango RFCs](https://github.com/tango-controls/rfc) (RFC-2 Device, RFC-3
 Command, RFC-4 Attribute, RFC-7 Pipe, RFC-9 Data Types) and provides an
 implementation of **RFC-10 "The Request-Reply protocol"** that replaces the
-CORBA transport (RFC-11) by a plain TCP socket carrying line-delimited JSON.
+CORBA transport (RFC-11) by the gRPC service `tango.v1.Device` (protobuf envelope, JSON operation).
 
 The set of low-level requests is taken from the *Tango Request-Reply
 cheatsheet* ("Tango Request-Reply" spreadsheet, sheet `REQUEST-REPLY`).
@@ -19,25 +19,35 @@ described in RFC 2119.
 
 ---
 
-## 1. Transport
+## 1. Transport — gRPC
 
-* The server SHALL listen on a TCP port. One server process (Device Server,
-  RFC-8) MAY host any number of devices on the same port.
-* A frame SHALL be one UTF-8 JSON object terminated by a single `\n`
-  (JSON Lines). JSON string escaping guarantees a frame never contains a raw
-  newline.
-* The client sends *Request* frames, the server answers each with exactly one
-  *Reply* frame. On a given connection replies SHALL be sent in request order;
-  a client MAY therefore pipeline requests.
-* A server SHALL serve several connections concurrently.
-* Access to one device SHALL be serialised (Tango "by device" serialisation
-  model): two requests never execute concurrently on the same device.
-* The protocol is human readable, a device can be driven with `nc`:
+* The server SHALL expose the unary gRPC service `tango.v1.Device/Call`
+  defined in [`proto/tango.proto`](../proto/tango.proto) (HTTP/2, plain text
+  in the PoC; TLS is a tonic option). One server process (Device Server,
+  RFC-8) MAY host any number of devices on the same endpoint.
+* The client URL is `grpc://host:port/domain/family/member`.
+* The *Request* envelope fields of §2.1 (`v`, `id`, `client`, `source`,
+  `device`) are protobuf fields; `op` is the JSON `Op` of §3 carried as
+  `bytes`. The *Reply* carries `id` and the JSON
+  `{"Ok": Data} | {"Err": DevFailed}` as `bytes`.
+* Tango errors (`DevFailed`) are part of the reply, never a gRPC status; a
+  non-OK gRPC status means a transport failure (`API_CommunicationFailed`).
+* Calls are multiplexed on one HTTP/2 connection and MAY complete in any
+  order; each call is independent. Access to one device SHALL be serialised
+  (Tango "by device" serialisation model).
+* The black box records the peer socket address.
+* Any gRPC language can drive a device from the `.proto`, e.g. Python:
 
+```python
+stub = tango_pb2_grpc.DeviceStub(grpc.insecure_channel("localhost:10000"))
+r = stub.Call(tango_pb2.Request(v=1, id=1, device="sys/tg/1", op=b'"DeviceName"'))
+json.loads(r.reply)  # {'Ok': {'String': 'sys/tg/1'}}
 ```
-$ echo '{"v":1,"id":1,"device":"sys/tg/1","op":"DeviceName"}' | nc localhost 10000
-{"id":1,"reply":{"Ok":{"String":"sys/tg/1"}}}
-```
+
+Why the operation stays JSON: the Tango model (30 data types, 21
+operations) is defined once in Rust and the `.proto` stays 20 lines. A fully
+typed `.proto` (one `oneof` per `Op`/`Value`) is the natural next step if
+schema-checked clients matter more than code size.
 
 ## 2. Frames
 

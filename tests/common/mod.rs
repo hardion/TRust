@@ -136,5 +136,5 @@ pub async fn start() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(server().run(listener));
-    addr
+    format!("grpc://{addr}")
 }
