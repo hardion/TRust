@@ -63,3 +63,10 @@ async fn tango_scheme_prefix() {
     let mut dev = DeviceProxy::connect(&format!("tango://{addr}/{DEV}")).await.unwrap();
     assert_eq!(dev.name().await.unwrap(), DEV);
 }
+
+#[tokio::test]
+async fn black_box_records_tcp_peer() {
+    let addr = start().await;
+    let mut dev = DeviceProxy::connect(&format!("{addr}/{DEV}")).await.unwrap();
+    assert!(dev.black_box(1).await.unwrap()[0].host.starts_with("127.0.0.1:"));
+}

@@ -48,7 +48,7 @@ async fn black_box() {
     let ops: Vec<_> = records.iter().map(|r| r.operation.as_str()).collect();
     assert_eq!(ops, ["DeviceBlackbox", "DevicePing", "DeviceName"]);
     assert!(records.iter().all(|r| r.client_id == std::process::id() as u64 && r.source == Source::Dev));
-    assert!(records[0].host.starts_with("127.0.0.1"));
+    assert!(!records[0].host.is_empty(), "peer recorded");
     assert!(records[0].time >= records[1].time);
     assert_eq!(dev.black_box(100).await.unwrap().len(), 4, "limited to what is stored");
     assert_eq!(dev.black_box(0).await.unwrap_err().reason(), "API_BlackBoxArgument");
