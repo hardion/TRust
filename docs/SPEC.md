@@ -1,4 +1,4 @@
-# TRust — Tango Request-Reply over a simple socket protocol
+# TRust — Tango Request-Reply over ZeroMQ
 
 Status: **Draft / Proof of Concept** — protocol version `1`.
 
@@ -6,7 +6,7 @@ TRust implements the Tango device model as defined by the
 [Tango RFCs](https://github.com/tango-controls/rfc) (RFC-2 Device, RFC-3
 Command, RFC-4 Attribute, RFC-7 Pipe, RFC-9 Data Types) and provides an
 implementation of **RFC-10 "The Request-Reply protocol"** that replaces the
-CORBA transport (RFC-11) by a plain TCP socket carrying line-delimited JSON.
+CORBA transport (RFC-11) by ZeroMQ ROUTER/REQ sockets carrying one JSON frame per message.
 
 The set of low-level requests is taken from the *Tango Request-Reply
 cheatsheet* ("Tango Request-Reply" spreadsheet, sheet `REQUEST-REPLY`).
@@ -19,25 +19,33 @@ described in RFC 2119.
 
 ---
 
-## 1. Transport
+## 1. Transport — ZeroMQ
 
-* The server SHALL listen on a TCP port. One server process (Device Server,
-  RFC-8) MAY host any number of devices on the same port.
-* A frame SHALL be one UTF-8 JSON object terminated by a single `\n`
-  (JSON Lines). JSON string escaping guarantees a frame never contains a raw
-  newline.
-* The client sends *Request* frames, the server answers each with exactly one
-  *Reply* frame. On a given connection replies SHALL be sent in request order;
-  a client MAY therefore pipeline requests.
-* A server SHALL serve several connections concurrently.
+* The server SHALL bind one ZeroMQ `ROUTER` socket (ZMTP 3.x, NULL security)
+  to an endpoint (`tcp://host:port`, `ipc://path`). One server process
+  (Device Server, RFC-8) MAY host any number of devices on the same socket.
+* A client SHALL use a `REQ` or a `DEALER` socket. The client URL is the
+  endpoint prefixed with `zmq+`: `zmq+tcp://host:5555/sys/tg/1`.
+* A *Request* frame SHALL be the last frame of a ZeroMQ message; the
+  frames before it are the routing envelope (identity and, for `REQ`, the
+  empty delimiter) and SHALL be copied unchanged in front of the *Reply*.
+* Each request receives exactly one reply. Requests from different peers, or
+  pipelined by a `DEALER` peer, MAY be answered out of order: clients match
+  replies by `id`. A `REQ` client is lock-step by construction.
 * Access to one device SHALL be serialised (Tango "by device" serialisation
   model): two requests never execute concurrently on the same device.
-* The protocol is human readable, a device can be driven with `nc`:
+* The black box records the peer as `zmq:<routing identity in hex>`.
+* Any ZeroMQ binding can drive a device, e.g. pyzmq:
 
+```python
+s = zmq.Context().socket(zmq.REQ); s.connect("tcp://localhost:10000")
+s.send_json({"v": 1, "id": 1, "device": "sys/tg/1", "op": "DeviceName"})
+s.recv_json()  # {'id': 1, 'reply': {'Ok': {'String': 'sys/tg/1'}}}
 ```
-$ echo '{"v":1,"id":1,"device":"sys/tg/1","op":"DeviceName"}' | nc localhost 10000
-{"id":1,"reply":{"Ok":{"String":"sys/tg/1"}}}
-```
+
+Why ZeroMQ: it is already the event transport of Tango 9 (RFC-13), so one
+library serves both request-reply and publish-subscribe; reconnection,
+`ipc://` and multi-peer routing come for free.
 
 ## 2. Frames
 

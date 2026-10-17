@@ -5,7 +5,6 @@ use crate::types::*;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use tokio::net::TcpListener;
 
 const BLACK_BOX_DEPTH: usize = 50;
 const POLL_RING_DEPTH: usize = 10;
@@ -417,7 +416,7 @@ impl Handler {
     }
 }
 
-/// A device server (RFC-8): hosts devices on one TCP port.
+/// A device server (RFC-8): hosts devices on one endpoint.
 pub struct Server {
     exec: String,
     instance: String,
@@ -447,10 +446,10 @@ impl Server {
         self
     }
 
-    /// Serves the devices over TCP (JSON Lines) forever.
-    pub async fn run(self, listener: TcpListener) -> DevResult<()> {
-        let handler = self.start(&listener.local_addr()?.ip().to_string())?;
-        crate::tcp::serve(listener, handler).await
+    /// Serves the devices on a ZeroMQ ROUTER socket bound to `endpoint` (e.g. `tcp://0.0.0.0:5555`) forever.
+    pub async fn run(self, endpoint: &str) -> DevResult<()> {
+        let handler = self.start(endpoint)?;
+        crate::zmq::serve(endpoint, handler).await
     }
 
     /// Initialises and exports the devices, starts polling and returns the request handler.

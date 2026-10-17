@@ -1,8 +1,8 @@
 //! Client side: `DeviceProxy`, one connection to one device.
 
 use crate::protocol::*;
-use crate::tcp::Link;
 use crate::types::*;
+use crate::zmq::Link;
 use std::time::{Duration, Instant};
 
 pub struct DeviceProxy {
@@ -54,10 +54,11 @@ macro_rules! call {
 }
 
 impl DeviceProxy {
-    /// `url` is `<endpoint>/domain/family/member`, here `[tango://]host:port/domain/family/member`.
+    /// `url` is `<endpoint>/domain/family/member`, here `[zmq+]tcp://host:port/domain/family/member`
+    /// (any ZeroMQ endpoint, e.g. `zmq+ipc:///tmp/tango/domain/family/member`).
     pub async fn connect(url: &str) -> DevResult<Self> {
         let (endpoint, device) = split_url(url)?;
-        let endpoint = endpoint.strip_prefix("tango://").unwrap_or(endpoint);
+        let endpoint = endpoint.strip_prefix("zmq+").unwrap_or(endpoint);
         Ok(Self { device: device.into(), source: Source::Dev, next_id: 0, link: Link::connect(endpoint).await? })
     }
 

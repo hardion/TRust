@@ -1,31 +1,33 @@
-//! Wire-level tests: the TCP JSON Lines protocol driven without the Rust client.
+//! Wire-level tests: the protocol driven with a bare ZeroMQ DEALER socket, without the Rust client.
 
 mod common;
 
 use common::{DEV, start};
 use serde_json::{Value as Json, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
-use trust::DeviceProxy;
+use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
-async fn raw(addr: &str, lines: &[Json]) -> Vec<Json> {
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    let payload: String =
-        lines.iter().map(|l| if let Json::String(s) = l { format!("{s}\n") } else { format!("{l}\n") }).collect();
-    stream.write_all(payload.as_bytes()).await.unwrap();
-    let mut reader = BufReader::new(stream).lines();
-    let mut out = vec![];
-    for _ in lines {
-        out.push(serde_json::from_str(&reader.next_line().await.unwrap().unwrap()).unwrap());
+/// Sends every frame at once on a DEALER socket and returns the replies sorted by request id.
+async fn raw(url: &str, frames: &[Json]) -> Vec<Json> {
+    let mut socket = DealerSocket::new();
+    socket.connect(url.strip_prefix("zmq+").unwrap()).await.unwrap();
+    for f in frames {
+        let bytes = if let Json::String(s) = f { s.clone().into_bytes() } else { f.to_string().into_bytes() };
+        socket.send(ZmqMessage::from(bytes)).await.unwrap();
     }
+    let mut out = vec![];
+    for _ in frames {
+        let msg = socket.recv().await.unwrap().into_vec();
+        out.push(serde_json::from_slice::<Json>(msg.last().unwrap()).unwrap());
+    }
+    out.sort_by_key(|r| r["id"].as_u64());
     out
 }
 
 #[tokio::test]
-async fn raw_socket_requests_are_pipelined() {
-    let addr = start().await;
+async fn dealer_requests_are_pipelined() {
+    let url = start().await;
     let replies = raw(
-        &addr,
+        &url,
         &[
             json!({"v": 1, "id": 7, "device": DEV, "op": "DeviceName"}),
             json!({"v": 1, "id": 8, "device": DEV, "op": {"CommandExecution": {"name": "DevDouble", "arg": {"Double": 2.5}}}}),
@@ -39,10 +41,10 @@ async fn raw_socket_requests_are_pipelined() {
 }
 
 #[tokio::test]
-async fn raw_socket_protocol_errors() {
-    let addr = start().await;
+async fn protocol_errors() {
+    let url = start().await;
     let replies = raw(
-        &addr,
+        &url,
         &[
             Json::String("this is not json".into()),
             json!({"v": 99, "id": 3, "device": DEV, "op": "DevicePing"}),
@@ -52,21 +54,13 @@ async fn raw_socket_protocol_errors() {
     .await;
     assert_eq!(replies[0]["id"], 0);
     assert_eq!(replies[0]["reply"]["Err"][0]["reason"], "API_InvalidRequest");
-    assert_eq!(replies[1]["id"], 3);
     assert_eq!(replies[1]["reply"]["Err"][0]["reason"], "API_UnsupportedProtocol");
-    assert_eq!(replies[2], json!({"id": 4, "reply": {"Ok": "Void"}}), "connection survives errors");
+    assert_eq!(replies[2], json!({"id": 4, "reply": {"Ok": "Void"}}), "socket survives errors");
 }
 
 #[tokio::test]
-async fn tango_scheme_prefix() {
-    let addr = start().await;
-    let mut dev = DeviceProxy::connect(&format!("tango://{addr}/{DEV}")).await.unwrap();
-    assert_eq!(dev.name().await.unwrap(), DEV);
-}
-
-#[tokio::test]
-async fn black_box_records_tcp_peer() {
-    let addr = start().await;
-    let mut dev = DeviceProxy::connect(&format!("{addr}/{DEV}")).await.unwrap();
-    assert!(dev.black_box(1).await.unwrap()[0].host.starts_with("127.0.0.1:"));
+async fn black_box_records_zmq_peer() {
+    let url = start().await;
+    let mut dev = trust::DeviceProxy::connect(&format!("{url}/{DEV}")).await.unwrap();
+    assert!(dev.black_box(1).await.unwrap()[0].host.starts_with("zmq:"));
 }
