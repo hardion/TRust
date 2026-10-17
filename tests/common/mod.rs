@@ -2,7 +2,6 @@
 #![allow(dead_code)]
 
 use std::time::Duration;
-use tokio::net::TcpListener;
 use trust::{
     AttrInfo, CmdInfo, DataFormat as F, DataType as T, DevFailed, DevResult, DevState, Device, PipeBlob, PipeInfo,
     Server, Value, Writable as W,
@@ -131,10 +130,26 @@ pub fn server() -> Server {
         .poll_command(DEV, "Counter", POLL)
 }
 
-/// Starts a server on a random port and returns its address.
+/// A free local TCP port.
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+/// Zenoh peer listening on `locator`, without multicast scouting so that tests stay isolated.
+pub fn zenoh_config(locator: &str) -> zenoh::Config {
+    let mut c = zenoh::Config::default();
+    c.insert_json5("listen/endpoints", &format!(r#"["{locator}"]"#)).unwrap();
+    c.insert_json5("scouting/multicast/enabled", "false").unwrap();
+    c
+}
+
+/// Starts a server on a random port and returns its endpoint URL (without the device name).
 pub async fn start() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    tokio::spawn(server().run(listener));
-    addr
+    let port = free_port();
+    let locator = format!("tcp/127.0.0.1:{port}");
+    tokio::spawn(server().run(zenoh_config(&locator)));
+    while tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    format!("zenoh://{locator}")
 }

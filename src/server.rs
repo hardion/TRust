@@ -5,7 +5,6 @@ use crate::types::*;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use tokio::net::TcpListener;
 
 const BLACK_BOX_DEPTH: usize = 50;
 const POLL_RING_DEPTH: usize = 10;
@@ -415,9 +414,14 @@ impl Handler {
         };
         serde_json::to_vec(&reply).expect("a reply is always serialisable")
     }
+
+    /// Names (lower case) of the exported devices, the admin device included.
+    pub fn devices(&self) -> Vec<String> {
+        self.0.devices.keys().cloned().collect()
+    }
 }
 
-/// A device server (RFC-8): hosts devices on one TCP port.
+/// A device server (RFC-8): hosts devices on one Zenoh session.
 pub struct Server {
     exec: String,
     instance: String,
@@ -447,10 +451,12 @@ impl Server {
         self
     }
 
-    /// Serves the devices over TCP (JSON Lines) forever.
-    pub async fn run(self, listener: TcpListener) -> DevResult<()> {
-        let handler = self.start(&listener.local_addr()?.ip().to_string())?;
-        crate::tcp::serve(listener, handler).await
+    /// Joins the Zenoh network described by `config` and serves every device as the queryable
+    /// `tango/<device>` forever.
+    pub async fn run(self, config: zenoh::Config) -> DevResult<()> {
+        let session = crate::zenoh::open(config).await?;
+        let handler = self.start(&session.zid().to_string())?;
+        crate::zenoh::serve(session, handler).await
     }
 
     /// Initialises and exports the devices, starts polling and returns the request handler.

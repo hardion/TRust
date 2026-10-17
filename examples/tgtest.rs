@@ -1,13 +1,16 @@
-//! Runs the TgTest device server: `cargo run --example tgtest [addr]` (default 127.0.0.1:10000),
-//! then e.g. `echo '{"v":1,"id":1,"device":"sys/tg/1","op":"DeviceInfo"}' | nc -q1 127.0.0.1 10000`
+//! Runs the TgTest device server on Zenoh: `cargo run --example tgtest [locator]`
+//! (default `tcp/127.0.0.1:7447`, multicast scouting on), then connect with
+//! `DeviceProxy::connect("zenoh://tcp/127.0.0.1:7447/sys/tg/1")` or, on the same LAN,
+//! `DeviceProxy::connect("zenoh:///sys/tg/1")`.
 
 #[path = "../tests/common/mod.rs"]
 mod common;
 
 #[tokio::main]
 async fn main() -> trust::DevResult<()> {
-    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:10000".into());
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!("TgTest: {} and dserver/TgTest/test listening on {addr}", common::DEV);
-    common::server().run(listener).await
+    let locator = std::env::args().nth(1).unwrap_or_else(|| "tcp/127.0.0.1:7447".into());
+    let mut config = zenoh::Config::default();
+    config.insert_json5("listen/endpoints", &format!(r#"["{locator}"]"#)).expect("valid locator");
+    println!("TgTest: tango/{} and tango/dserver/tgtest/test on {locator}", common::DEV);
+    common::server().run(config).await
 }

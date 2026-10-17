@@ -1,4 +1,4 @@
-# TRust — Tango Request-Reply over a simple socket protocol
+# TRust — Tango Request-Reply over Zenoh
 
 Status: **Draft / Proof of Concept** — protocol version `1`.
 
@@ -6,7 +6,7 @@ TRust implements the Tango device model as defined by the
 [Tango RFCs](https://github.com/tango-controls/rfc) (RFC-2 Device, RFC-3
 Command, RFC-4 Attribute, RFC-7 Pipe, RFC-9 Data Types) and provides an
 implementation of **RFC-10 "The Request-Reply protocol"** that replaces the
-CORBA transport (RFC-11) by a plain TCP socket carrying line-delimited JSON.
+CORBA transport (RFC-11) by Zenoh queries: every device is the queryable `tango/<device>`.
 
 The set of low-level requests is taken from the *Tango Request-Reply
 cheatsheet* ("Tango Request-Reply" spreadsheet, sheet `REQUEST-REPLY`).
@@ -19,25 +19,40 @@ described in RFC 2119.
 
 ---
 
-## 1. Transport
+## 1. Transport — Zenoh
 
-* The server SHALL listen on a TCP port. One server process (Device Server,
-  RFC-8) MAY host any number of devices on the same port.
-* A frame SHALL be one UTF-8 JSON object terminated by a single `\n`
-  (JSON Lines). JSON string escaping guarantees a frame never contains a raw
-  newline.
-* The client sends *Request* frames, the server answers each with exactly one
-  *Reply* frame. On a given connection replies SHALL be sent in request order;
-  a client MAY therefore pipeline requests.
-* A server SHALL serve several connections concurrently.
-* Access to one device SHALL be serialised (Tango "by device" serialisation
-  model): two requests never execute concurrently on the same device.
-* The protocol is human readable, a device can be driven with `nc`:
+* Every exported device (the admin device included) SHALL be a Zenoh
+  *queryable* on the key expression `tango/<device name in lower case>`,
+  e.g. `tango/sys/tg/1`, `tango/dserver/tgtest/test`.
+* A *Request* is a Zenoh query (`get`) on that key whose payload is the
+  JSON request frame of §2.1; the *Reply* is the payload of the single
+  answer. The `device` field of the frame stays authoritative.
+* The key expression replaces the address: Zenoh routes the query to the
+  device wherever its server runs (peer-to-peer, through `zenohd` routers,
+  across sites). No naming service is needed to *locate* a device.
+* The client URL is `zenoh://<locator>/domain/family/member`, the locator
+  being any Zenoh endpoint (`tcp/host:7447`, `unixsock-stream/path`). An
+  empty locator, `zenoh:///sys/tg/1`, discovers peers and routers by
+  multicast scouting.
+* No answer within the timeout (3 s) → `API_DeviceNotFound`.
+* Queries are independent and MAY complete in any order. Access to one
+  device SHALL be serialised (Tango "by device" serialisation model).
+* The black box records the peer as `zenoh` (Zenoh does not expose the
+  querier address); DEVICE INFO `server_host` is the server's Zenoh id.
+* Any Zenoh binding can drive a device, e.g. Python:
 
+```python
+with zenoh.open(zenoh.Config()) as s:
+    req = {"v": 1, "id": 1, "device": "sys/tg/1", "op": "DeviceName"}
+    for r in s.get("tango/sys/tg/1", payload=json.dumps(req)):
+        json.loads(r.ok.payload.to_bytes())  # {'id': 1, 'reply': {'Ok': {'String': 'sys/tg/1'}}}
 ```
-$ echo '{"v":1,"id":1,"device":"sys/tg/1","op":"DeviceName"}' | nc localhost 10000
-{"id":1,"reply":{"Ok":{"String":"sys/tg/1"}}}
-```
+
+Why Zenoh: device names map directly to the key space, which gives
+location transparency and discovery; the same session provides
+publish-subscribe (Tango events, RFC-12) and storages (attribute history,
+memorised values) with one protocol, from microcontrollers (zenoh-pico) to
+WANs. It requires a multi-threaded tokio runtime.
 
 ## 2. Frames
 

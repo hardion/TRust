@@ -1,8 +1,8 @@
 //! Client side: `DeviceProxy`, one connection to one device.
 
 use crate::protocol::*;
-use crate::tcp::Link;
 use crate::types::*;
+use crate::zenoh::Link;
 use std::time::{Duration, Instant};
 
 pub struct DeviceProxy {
@@ -54,11 +54,18 @@ macro_rules! call {
 }
 
 impl DeviceProxy {
-    /// `url` is `<endpoint>/domain/family/member`, here `[tango://]host:port/domain/family/member`.
+    /// `url` is `<endpoint>/domain/family/member`, here `zenoh://[<zenoh locator>]/domain/family/member`:
+    /// `zenoh://tcp/host:7447/sys/tg/1` connects to that peer or router, `zenoh:///sys/tg/1`
+    /// discovers the device on the network (multicast scouting).
     pub async fn connect(url: &str) -> DevResult<Self> {
         let (endpoint, device) = split_url(url)?;
-        let endpoint = endpoint.strip_prefix("tango://").unwrap_or(endpoint);
-        Ok(Self { device: device.into(), source: Source::Dev, next_id: 0, link: Link::connect(endpoint).await? })
+        let endpoint = endpoint.strip_prefix("zenoh://").unwrap_or(endpoint);
+        Ok(Self {
+            device: device.into(),
+            source: Source::Dev,
+            next_id: 0,
+            link: Link::connect(endpoint, device).await?,
+        })
     }
 
     pub fn set_source(&mut self, source: Source) {

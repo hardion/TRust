@@ -16,7 +16,7 @@ async fn wait_polling() {
 
 // ---------------------------------------------------------------- device
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn device_identity() {
     let mut dev = proxy().await;
     assert_eq!(dev.name().await.unwrap(), DEV);
@@ -24,7 +24,7 @@ async fn device_identity() {
     assert_eq!(dev.adm_name().await.unwrap(), "dserver/TgTest/test");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn device_names_are_case_insensitive() {
     let addr = start().await;
     let mut dev = DeviceProxy::connect(&format!("{addr}/SYS/TG/1")).await.unwrap();
@@ -33,13 +33,13 @@ async fn device_names_are_case_insensitive() {
     assert!(dev.read_attribute("Double_Scalar").await.is_ok());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn ping() {
     let mut dev = proxy().await;
     assert!(dev.ping().await.unwrap() < std::time::Duration::from_secs(1));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn black_box() {
     let mut dev = proxy().await;
     dev.name().await.unwrap();
@@ -54,7 +54,7 @@ async fn black_box() {
     assert_eq!(dev.black_box(0).await.unwrap_err().reason(), "API_BlackBoxArgument");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn info() {
     let mut dev = proxy().await;
     let info = dev.info().await.unwrap();
@@ -64,14 +64,14 @@ async fn info() {
     assert!(!info.server_host.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn unknown_device() {
     let addr = start().await;
     let mut dev = DeviceProxy::connect(&format!("{addr}/no/such/device")).await.unwrap();
     assert_eq!(dev.ping().await.unwrap_err().reason(), "API_DeviceNotFound");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_device() {
     let addr = start().await;
     let mut dev = DeviceProxy::connect(&format!("{addr}/{DEV}")).await.unwrap();
@@ -91,7 +91,7 @@ async fn admin_device() {
 
 // ---------------------------------------------------------------- commands
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn command_execution() {
     let mut dev = proxy().await;
     assert_eq!(dev.command_inout("DevVoid", Value::Void).await.unwrap(), Value::Void);
@@ -101,7 +101,7 @@ async fn command_execution() {
     assert_eq!(dev.command_inout("DevVarLongArray", longs.clone()).await.unwrap(), longs);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn command_errors() {
     let mut dev = proxy().await;
     let err = dev.command_inout("Throw", Value::Void).await.unwrap_err();
@@ -112,7 +112,7 @@ async fn command_errors() {
     assert_eq!(err.reason(), "API_IncompatibleCmdArgumentType");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn builtin_commands() {
     let mut dev = proxy().await;
     assert_eq!(dev.command_inout("State", Value::Void).await.unwrap(), Value::State(DevState::On));
@@ -123,7 +123,7 @@ async fn builtin_commands() {
     assert_eq!(dev.command_inout("Init", Value::Void).await.unwrap(), Value::Void);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn command_list_and_query() {
     let mut dev = proxy().await;
     let cmds = dev.command_list_query().await.unwrap();
@@ -138,7 +138,7 @@ async fn command_list_and_query() {
     assert_eq!(dev.command_query("Nope").await.unwrap_err().reason(), "API_CommandNotFound");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn command_history() {
     let mut dev = proxy().await;
     wait_polling().await;
@@ -154,7 +154,7 @@ async fn command_history() {
 
 // ---------------------------------------------------------------- attributes
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn read_attributes() {
     let mut dev = proxy().await;
     let values =
@@ -173,7 +173,7 @@ async fn read_attributes() {
     assert_eq!(values[5].as_ref().unwrap_err().reason(), "TG_ReadFailed");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn write_attributes() {
     let mut dev = proxy().await;
     dev.write_attributes(&[("double_scalar", Value::Double(12.5)), ("string_scalar", Value::String("x".into()))])
@@ -185,7 +185,7 @@ async fn write_attributes() {
     assert_eq!(dev.read_attribute("string_scalar").await.unwrap().value, Value::String("x".into()));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn write_errors() {
     let mut dev = proxy().await;
     let reason = |e: DevFailed| e.reason().to_owned();
@@ -220,7 +220,7 @@ async fn write_errors() {
     assert_eq!(dev.read_attribute("double_scalar").await.unwrap().value, Value::Double(7.0));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn write_read_attributes() {
     let mut dev = proxy().await;
     let values = dev
@@ -233,7 +233,7 @@ async fn write_read_attributes() {
     assert_eq!(err.reason(), "API_AttrNotWritable");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn attribute_quality_and_alarm_state() {
     let mut dev = proxy().await;
     for (v, quality, state) in [
@@ -248,7 +248,7 @@ async fn attribute_quality_and_alarm_state() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn attribute_get_config() {
     let mut dev = proxy().await;
     let all = dev.get_attribute_config(&[]).await.unwrap();
@@ -266,7 +266,7 @@ async fn attribute_get_config() {
     assert_eq!(dev.get_attribute_config(&["nope"]).await.unwrap_err().reason(), "API_AttrNotFound");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn attribute_set_config() {
     let mut dev = proxy().await;
     let mut cfg = dev.get_attribute_config(&["double_scalar"]).await.unwrap().remove(0);
@@ -287,7 +287,7 @@ async fn attribute_set_config() {
     assert_eq!(dev.set_attribute_config(vec![cfg]).await.unwrap_err().reason(), "API_IncoherentValues");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn attribute_history() {
     let mut dev = proxy().await;
     wait_polling().await;
@@ -304,7 +304,7 @@ async fn attribute_history() {
 
 // ---------------------------------------------------------------- source
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn source_cache() {
     let mut dev = proxy().await;
     wait_polling().await;
@@ -326,7 +326,7 @@ async fn source_cache() {
 
 // ---------------------------------------------------------------- pipes
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn pipe_read_write() {
     let mut dev = proxy().await;
     let p = dev.read_pipe("blob").await.unwrap();
@@ -341,7 +341,7 @@ async fn pipe_read_write() {
     assert_eq!(dev.read_pipe("nope").await.unwrap_err().reason(), "API_PipeNotFound");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn pipe_config() {
     let mut dev = proxy().await;
     assert_eq!(dev.get_pipe_config(&[]).await.unwrap().len(), 2);
@@ -355,7 +355,7 @@ async fn pipe_config() {
     assert_eq!(dev.get_pipe_config(&["nope"]).await.unwrap_err().reason(), "API_PipeNotFound");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn concurrent_clients() {
     let addr = start().await;
     let tasks: Vec<_> = (0..10)
