@@ -1,11 +1,9 @@
 //! Validation tests: one group per row of the Tango Request-Reply cheatsheet (see docs/SPEC.md).
+//! Transport independent: `common::start()` returns the endpoint URL of a fresh server.
 
 mod common;
 
 use common::{DEV, POLL, start};
-use serde_json::{Value as Json, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use trust::*;
 
 async fn proxy() -> DeviceProxy {
@@ -29,7 +27,7 @@ async fn device_identity() {
 #[tokio::test]
 async fn device_names_are_case_insensitive() {
     let addr = start().await;
-    let mut dev = DeviceProxy::connect(&format!("tango://{addr}/SYS/TG/1")).await.unwrap();
+    let mut dev = DeviceProxy::connect(&format!("{addr}/SYS/TG/1")).await.unwrap();
     assert_eq!(dev.name().await.unwrap(), DEV);
     assert_eq!(dev.command_inout("devdouble", Value::Double(1.5)).await.unwrap(), Value::Double(1.5));
     assert!(dev.read_attribute("Double_Scalar").await.is_ok());
@@ -355,57 +353,6 @@ async fn pipe_config() {
     let new = dev.set_pipe_config(vec![cfg]).await.unwrap().remove(0);
     assert_eq!((new.label.as_str(), new.description.as_str(), new.writable), ("Blob", "a blob", true));
     assert_eq!(dev.get_pipe_config(&["nope"]).await.unwrap_err().reason(), "API_PipeNotFound");
-}
-
-// ---------------------------------------------------------------- raw socket protocol
-
-async fn raw(addr: &str, lines: &[Json]) -> Vec<Json> {
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    let payload: String =
-        lines.iter().map(|l| if let Json::String(s) = l { format!("{s}\n") } else { format!("{l}\n") }).collect();
-    stream.write_all(payload.as_bytes()).await.unwrap();
-    let mut reader = BufReader::new(stream).lines();
-    let mut out = vec![];
-    for _ in lines {
-        out.push(serde_json::from_str(&reader.next_line().await.unwrap().unwrap()).unwrap());
-    }
-    out
-}
-
-#[tokio::test]
-async fn raw_socket_requests_are_pipelined() {
-    let addr = start().await;
-    let replies = raw(
-        &addr,
-        &[
-            json!({"v": 1, "id": 7, "device": DEV, "op": "DeviceName"}),
-            json!({"v": 1, "id": 8, "device": DEV, "op": {"CommandExecution": {"name": "DevDouble", "arg": {"Double": 2.5}}}}),
-            json!({"v": 1, "id": 9, "client": 42, "source": "CACHE_DEV", "device": DEV, "op": {"AttributesRead": {"names": ["State"]}}}),
-        ],
-    )
-    .await;
-    assert_eq!(replies[0], json!({"id": 7, "reply": {"Ok": {"String": DEV}}}));
-    assert_eq!(replies[1], json!({"id": 8, "reply": {"Ok": {"Value": {"Double": 2.5}}}}));
-    assert_eq!(replies[2]["reply"]["Ok"]["Attributes"][0]["Ok"]["value"], json!({"State": "ON"}));
-}
-
-#[tokio::test]
-async fn raw_socket_protocol_errors() {
-    let addr = start().await;
-    let replies = raw(
-        &addr,
-        &[
-            Json::String("this is not json".into()),
-            json!({"v": 99, "id": 3, "device": DEV, "op": "DevicePing"}),
-            json!({"v": 1, "id": 4, "device": DEV, "op": "DevicePing"}),
-        ],
-    )
-    .await;
-    assert_eq!(replies[0]["id"], 0);
-    assert_eq!(replies[0]["reply"]["Err"][0]["reason"], "API_InvalidRequest");
-    assert_eq!(replies[1]["id"], 3);
-    assert_eq!(replies[1]["reply"]["Err"][0]["reason"], "API_UnsupportedProtocol");
-    assert_eq!(replies[2], json!({"id": 4, "reply": {"Ok": "Void"}}), "connection survives errors");
 }
 
 #[tokio::test]

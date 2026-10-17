@@ -5,9 +5,10 @@
 mod client;
 mod protocol;
 mod server;
+mod tcp;
 mod types;
 
 pub use client::DeviceProxy;
 pub use protocol::*;
-pub use server::{Device, Server};
+pub use server::{Device, Handler, Server};
 pub use types::*;
