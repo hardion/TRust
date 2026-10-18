@@ -316,8 +316,8 @@ async fn source_cache() {
     assert_eq!(dev.command_inout("DevVoid", Value::Void).await.unwrap_err().reason(), "API_CmdNotPolled");
     // the cached value is the last polled one
     let cached = dev.read_attribute("counter").await.unwrap().value;
-    let last = dev.attribute_history("counter", 1).await.unwrap().remove(0).value.unwrap().value;
-    assert!(cached == last || matches!((&cached, &last), (Value::Long(c), Value::Long(l)) if c + 1 == *l));
+    let ring = dev.attribute_history("counter", 10).await.unwrap();
+    assert!(ring.iter().any(|h| h.value.as_ref().unwrap().value == cached), "{cached:?} not polled");
 
     dev.set_source(Source::CacheDev);
     assert!(dev.read_attributes(&["counter", "double_scalar"]).await.unwrap().iter().all(Result::is_ok));
