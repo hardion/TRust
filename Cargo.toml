@@ -2,10 +2,39 @@
 name = "trust"
 version = "0.1.0"
 edition = "2024"
-description = "PoC of a Tango-compatible control system: RFC device model over a simple socket request-reply protocol"
+description = "PoC of a Tango-compatible control system: RFC device model over pluggable request-reply transports"
 license = "GPL-3.0-or-later"
+
+[features]
+default = ["tcp"]
+# JSON Lines over TCP
+tcp = []
+# ZeroMQ ROUTER/REQ (pure Rust, no libzmq)
+zmq = ["dep:zeromq"]
+# gRPC service tango.v1.Device (tonic)
+grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost", "dep:tokio-stream", "dep:tonic-prost-build", "dep:protoc-bin-vendored"]
+# Zenoh queryables tango/<device>
+zenoh = ["dep:zenoh"]
+# one port for every enabled TCP based wire (server) and auto:// probing (client)
+detect = ["tcp"]
+full = ["tcp", "zmq", "grpc", "zenoh", "detect"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport", "ipc-transport"], optional = true }
+prost = { version = "0.14", optional = true }
+tokio-stream = { version = "0.1", features = ["net"], optional = true }
+tonic = { version = "0.14", optional = true }
+tonic-prost = { version = "0.14", optional = true }
+zenoh = { version = "1", default-features = false, features = ["transport_tcp", "transport_unixsock-stream"], optional = true }
+
+[build-dependencies]
+protoc-bin-vendored = { version = "3", optional = true }
+tonic-prost-build = { version = "0.14", optional = true }
+
+
+[[example]]
+name = "bench"
+required-features = ["full"]

@@ -1,7 +1,7 @@
 //! Client side: `DeviceProxy`, one connection to one device.
 
 use crate::protocol::*;
-use crate::tcp::Link;
+use crate::transport::Link;
 use crate::types::*;
 use std::time::{Duration, Instant};
 
@@ -54,11 +54,13 @@ macro_rules! call {
 }
 
 impl DeviceProxy {
-    /// `url` is `<endpoint>/domain/family/member`, here `[tango://]host:port/domain/family/member`.
+    /// `url` is `<endpoint>/domain/family/member`, the endpoint scheme choosing the transport:
+    /// `tcp://host:port`, `zmq+tcp://host:port`, `grpc://host:port`, `zenoh://tcp/host:7447`,
+    /// `zenoh://` (discovery), `auto://host:port` (probe), see `Scheme`.
     pub async fn connect(url: &str) -> DevResult<Self> {
         let (endpoint, device) = split_url(url)?;
-        let endpoint = endpoint.strip_prefix("tango://").unwrap_or(endpoint);
-        Ok(Self { device: device.into(), source: Source::Dev, next_id: 0, link: Link::connect(endpoint).await? })
+        let link = Link::connect(endpoint, device).await?;
+        Ok(Self { device: device.into(), source: Source::Dev, next_id: 0, link })
     }
 
     pub fn set_source(&mut self, source: Source) {
@@ -68,8 +70,7 @@ impl DeviceProxy {
     async fn call(&mut self, op: Op) -> DevResult<Data> {
         self.next_id += 1;
         let (id, client, source, device) = (self.next_id, std::process::id() as u64, self.source, self.device.clone());
-        let frame = serde_json::to_vec(&Request { v: PROTOCOL_VERSION, id, client, source, device, op })?;
-        let reply: Reply = serde_json::from_slice(&self.link.call(frame).await?)?;
+        let reply = self.link.call(Request { v: PROTOCOL_VERSION, id, client, source, device, op }).await?;
         if reply.id != id {
             return Err(bad_reply(reply));
         }

@@ -1,8 +1,13 @@
 //! Wire-level tests: the TCP JSON Lines protocol driven without the Rust client.
+#![cfg(feature = "tcp")]
 
 mod common;
 
-use common::{DEV, start};
+async fn start() -> String {
+    common::start("tcp://127.0.0.1:{port}", "127.0.0.1:{port}").await // no scheme: TCP
+}
+
+use common::DEV;
 use serde_json::{Value as Json, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -21,7 +26,7 @@ async fn raw(addr: &str, lines: &[Json]) -> Vec<Json> {
     out
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn raw_socket_requests_are_pipelined() {
     let addr = start().await;
     let replies = raw(
@@ -38,7 +43,7 @@ async fn raw_socket_requests_are_pipelined() {
     assert_eq!(replies[2]["reply"]["Ok"]["Attributes"][0]["Ok"]["value"], json!({"State": "ON"}));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn raw_socket_protocol_errors() {
     let addr = start().await;
     let replies = raw(
@@ -57,14 +62,14 @@ async fn raw_socket_protocol_errors() {
     assert_eq!(replies[2], json!({"id": 4, "reply": {"Ok": "Void"}}), "connection survives errors");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn tango_scheme_prefix() {
     let addr = start().await;
     let mut dev = DeviceProxy::connect(&format!("tango://{addr}/{DEV}")).await.unwrap();
     assert_eq!(dev.name().await.unwrap(), DEV);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn black_box_records_tcp_peer() {
     let addr = start().await;
     let mut dev = DeviceProxy::connect(&format!("{addr}/{DEV}")).await.unwrap();

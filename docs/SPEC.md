@@ -1,4 +1,4 @@
-# TRust — Tango Request-Reply over a simple socket protocol
+# TRust — Tango Request-Reply over pluggable transports
 
 Status: **Draft / Proof of Concept** — protocol version `1`.
 
@@ -6,7 +6,7 @@ TRust implements the Tango device model as defined by the
 [Tango RFCs](https://github.com/tango-controls/rfc) (RFC-2 Device, RFC-3
 Command, RFC-4 Attribute, RFC-7 Pipe, RFC-9 Data Types) and provides an
 implementation of **RFC-10 "The Request-Reply protocol"** that replaces the
-CORBA transport (RFC-11) by a plain TCP socket carrying line-delimited JSON.
+CORBA transport (RFC-11) by pluggable transports: JSON Lines over TCP, ZeroMQ, gRPC and Zenoh, selected by Cargo feature, by URL scheme or by detection of the wire.
 
 The set of low-level requests is taken from the *Tango Request-Reply
 cheatsheet* ("Tango Request-Reply" spreadsheet, sheet `REQUEST-REPLY`).
@@ -21,18 +21,30 @@ described in RFC 2119.
 
 ## 1. Transport
 
-* The server SHALL listen on a TCP port. One server process (Device Server,
-  RFC-8) MAY host any number of devices on the same port.
-* A frame SHALL be one UTF-8 JSON object terminated by a single `\n`
-  (JSON Lines). JSON string escaping guarantees a frame never contains a raw
-  newline.
-* The client sends *Request* frames, the server answers each with exactly one
-  *Reply* frame. On a given connection replies SHALL be sent in request order;
-  a client MAY therefore pipeline requests.
-* A server SHALL serve several connections concurrently.
+The frames of §2 are carried by one of several transports, selected by the
+scheme of the endpoint URL and compiled in with Cargo features. The
+comparison and the design live in [`TRANSPORTS.md`](TRANSPORTS.md).
+
+| Scheme | Transport | Feature | Mapping |
+|---|---|---|---|
+| none, `tcp://`, `tango://` | JSON Lines over TCP | `tcp` (default) | one frame per `\n` terminated line, replies in request order |
+| `zmq+tcp://`, `zmq+ipc://` | ZeroMQ | `zmq` | `ROUTER` server, `REQ`/`DEALER` client, frame = last message part |
+| `grpc://` | gRPC | `grpc` | unary `tango.v1.Device/Call` (`proto/tango.proto`), protobuf envelope, JSON `op`/`reply` |
+| `zenoh://<locator>` | Zenoh | `zenoh` | queryable `tango/<device in lower case>`, frame = query payload |
+| `auto://` | wire detection | `detect` | server: one port for every compiled TCP-based wire; client: probe |
+
+Common rules:
+
+* A client URL is `<endpoint>/domain/family/member`; the device name is
+  always the last three `/`-separated segments.
+* A server MAY serve the same devices on several endpoints at once.
+* Each request receives exactly one reply. Transports that allow
+  concurrency (ZeroMQ `DEALER`, HTTP/2, Zenoh) MAY reorder replies, so
+  clients match them by `id`.
 * Access to one device SHALL be serialised (Tango "by device" serialisation
   model): two requests never execute concurrently on the same device.
-* The protocol is human readable, a device can be driven with `nc`:
+* A scheme whose transport is not compiled in → `API_UnsupportedTransport`.
+* The plain TCP wire is human readable and can be driven with `nc`:
 
 ```
 $ echo '{"v":1,"id":1,"device":"sys/tg/1","op":"DeviceName"}' | nc localhost 10000

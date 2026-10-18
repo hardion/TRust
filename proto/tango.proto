@@ -1,0 +1,33 @@
+// Tango request-reply (RFC-10) over gRPC, see docs/SPEC.md.
+//
+// The envelope is typed so that gRPC tooling (routing, logging, metadata) sees the device and the
+// request id. The operation and its result keep the JSON encoding of SPEC §3: the Tango model is
+// defined once, in the Rust types, and any gRPC client only needs a JSON library on top.
+syntax = "proto3";
+
+package tango.v1;
+
+service Device {
+  // One Tango operation on one device.
+  rpc Call(Request) returns (Reply);
+}
+
+enum Source {
+  DEV = 0;
+  CACHE = 1;
+  CACHE_DEV = 2;
+}
+
+message Request {
+  uint32 v = 1;       // protocol version, 1
+  uint64 id = 2;      // request id, echoed in the reply
+  uint64 client = 3;  // client id, recorded in the black box
+  Source source = 4;
+  string device = 5;  // domain/family/member
+  bytes op = 6;       // JSON `Op`, e.g. {"CommandExecution":{"name":"DevDouble","arg":{"Double":1}}}
+}
+
+message Reply {
+  uint64 id = 1;
+  bytes reply = 2;    // JSON {"Ok": Data} | {"Err": DevFailed}
+}

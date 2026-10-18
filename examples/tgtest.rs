@@ -1,13 +1,18 @@
-//! Runs the TgTest device server: `cargo run --example tgtest [addr]` (default 127.0.0.1:10000),
-//! then e.g. `echo '{"v":1,"id":1,"device":"sys/tg/1","op":"DeviceInfo"}' | nc -q1 127.0.0.1 10000`
+//! Runs the TgTest device server on the endpoints given as arguments, e.g.
+//! `cargo run --features full --example tgtest auto://127.0.0.1:10000 zenoh://`
+//! (default: `auto://127.0.0.1:10000` with the `detect` feature, else `tcp://127.0.0.1:10000`).
+//! With `auto://`, JSON Lines (`nc`), ZeroMQ, gRPC and Zenoh clients share the one port.
 
 #[path = "../tests/common/mod.rs"]
 mod common;
 
 #[tokio::main]
 async fn main() -> trust::DevResult<()> {
-    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:10000".into());
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!("TgTest: {} and dserver/TgTest/test listening on {addr}", common::DEV);
-    common::server().run(listener).await
+    let default = if cfg!(feature = "detect") { "auto://127.0.0.1:10000" } else { "tcp://127.0.0.1:10000" };
+    let mut endpoints: Vec<String> = std::env::args().skip(1).collect();
+    if endpoints.is_empty() {
+        endpoints.push(default.into());
+    }
+    println!("TgTest: {} and dserver/TgTest/test on {endpoints:?}", common::DEV);
+    common::server().run(endpoints).await
 }
