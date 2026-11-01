@@ -137,10 +137,16 @@ pub fn free_port() -> u16 {
 
 /// Starts a server on a random port and returns its endpoint URL (without the device name).
 pub async fn start() -> String {
-    let port = free_port();
-    tokio::spawn(async move { server().run(&format!("tcp://127.0.0.1:{port}")).await.unwrap() });
-    while tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err() {
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    loop {
+        let port = free_port();
+        let task = tokio::spawn(async move { server().run(&format!("tcp://127.0.0.1:{port}")).await });
+        while !task.is_finished() && tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if !task.is_finished() {
+            return format!("zmq+tcp://127.0.0.1:{port}");
+        }
+        // another test took the port between free_port() and the bind: try another one
     }
-    format!("zmq+tcp://127.0.0.1:{port}")
 }
