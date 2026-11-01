@@ -1,0 +1,15 @@
+[package]
+name = "trust-databaseds"
+version = "0.1.0"
+edition = "2024"
+description = "The Tango Database device (RFC-6) for TRust, on SQLite"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "DataBaseds"
+path = "src/main.rs"
+
+[dependencies]
+trust = { path = "../..", features = ["full"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

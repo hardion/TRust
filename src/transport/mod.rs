@@ -169,7 +169,7 @@ mod tests {
         assert_eq!(p("ftp://h:1"), Err("API_UnsupportedTransport".into()));
         if cfg!(feature = "tcp") {
             assert_eq!(p("127.0.0.1:1"), Ok((Scheme::Tcp, "127.0.0.1:1".into())));
-            assert_eq!(p("tango://h:1"), Ok((Scheme::Tcp, "h:1".into())));
+            assert_eq!(p("tango://h:1"), Err("API_UnsupportedTransport".into()), "resolved by the client");
             assert_eq!(p("tcp://h:1"), Ok((Scheme::Tcp, "h:1".into())));
         } else {
             assert_eq!(p("tcp://h:1"), Err("API_UnsupportedTransport".into()));
