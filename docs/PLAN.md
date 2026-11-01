@@ -90,3 +90,61 @@ dev.read_attribute("double_scalar").await?;
 ## Out of scope
 
 See SPEC §6.
+
+---
+
+# Phase 2 — Tango compliance, Database, events, Starter, browser
+
+Specification: `docs/SPEC.md` §6–§10 (properties, naming and Database, admin
+device, events, Starter), `docs/BROWSER.md` (GUI and Starter interface),
+`docs/COMPLIANCE.md` (status of every RFC requirement).
+
+## Process
+
+As in phase 1, each milestone is: spec section (done for all milestones in
+this commit) → validation tests written first against the public API → the
+smallest implementation that passes them. Each milestone is one PR from its
+own branch, merged in order.
+
+## Workspace
+
+```
+Cargo.toml            workspace + the `trust` library (unchanged layout)
+apps/databaseds/      DataBaseds server: sys/database/2 on SQLite (rusqlite, bundled)
+apps/starter/         Starter server: tango/admin/<host>
+apps/browser/         trust-browser (eframe/egui, egui_plot, egui_kittest for tests)
+```
+
+Heavy dependencies (SQLite, egui) stay out of the library: the library only
+gains the Database *client* (property access, name resolution, export) and
+the event system.
+
+## Milestones
+
+| # | Content | Tests first |
+|---|---|---|
+| M1 | Properties (`PropInfo`, `Device::init(&Properties)`), Database device on SQLite with every RFC-6 command, Database-as-file, server life cycle (create from DB, export, unexport on Kill/SIGTERM), name resolution (`TANGO_HOST`, `tango://…`, `#dbase=no`, aliases) | one test group per RFC-6 command group, life-cycle tests (start a server, import it by name, kill it, see it unexported), property defaults/mandatory/types, file syntax parser |
+| M2 | Event system: event properties in `AttrInfo`, triggers (change, periodic, archive, user, attr conf, data ready, interface change, pipe), admin negotiation, heartbeat/confirm, sequence numbers and missed events, one channel implementation per transport, `subscribe_event` / `event_stream` | the event suite instantiated over every transport (like `tests/validation.rs`): each event type, thresholds, first synchronous event, unsubscribe, heartbeat loss → re-subscribe, unconfirmed subscription dropped, overflow → missed events |
+| M3 | Admin device completion: runtime polling commands, DevRestart/RestartServer/Kill, locking, logging (RFC-14); memorised attributes, enum labels, nested pipe blobs, READ_WITH_WRITE, MultiDevFailed, dynamic attributes for INTERFACE_CHANGE | one test per admin command; memorised value survives a restart through the Database |
+| M4 | Starter device: process management from `StartDsPath`, startup levels, states, logs, events on `Servers`/`HostState` | start/stop/kill the TgTest example server through a Starter registered in a test Database; level ordering; crash detection |
+| M5 | Browser: Database tree, device panel with generated forms, events-driven refresh, properties and attribute config editing, admin tab; Starter interface (hosts, servers by level, start/stop/log, server registration) | unit tests of the type → widget/value rules; `egui_kittest` UI tests against a live TgTest + Database + Starter |
+
+## Decisions taken
+
+| Question | Choice | Why |
+|---|---|---|
+| GUI toolkit | egui / eframe | generated forms are a few lines in immediate mode; native + WebAssembly |
+| Database backend | SQLite (rusqlite, bundled) | one file, SQL like the MySQL reference, no server to run |
+| Event channels | the transport of the request-reply connection | keeps "by compilation / by URL / by detection" unchanged for events |
+| Database argument layouts | identical to the C++ `DataBaseds` | the Tango documentation and tooling knowledge apply as is |
+| `tango://` scheme | now means "through the Database" (Tango semantics); direct access is `#dbase=no` or the transport schemes | follows the Tango naming RFC; phase 1 used it as a TCP alias |
+
+## Risks
+
+* **Scope**: about 100 Database commands. Most are the same get/put/delete
+  pattern over seven property kinds, so one generic property store and a
+  table that maps each command to it keep the code small.
+* **Starter process control** is Unix-first (signals, process groups); on
+  Windows only start and hard kill would work.
+* **egui_kittest** UI tests need a GPU-less renderer; the plan is the
+  accessibility-tree assertions only, without screenshot comparison.

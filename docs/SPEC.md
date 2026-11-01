@@ -1,4 +1,4 @@
-# TRust — Tango Request-Reply over pluggable transports
+# TRust — Tango control system over pluggable transports
 
 Status: **Draft / Proof of Concept** — protocol version `1`.
 
@@ -231,10 +231,248 @@ payload. `DevEnum` is transported as `Short` (RFC-9).
 
 Time is a `f64` number of seconds since the Unix epoch.
 
-## 6. Out of scope for the PoC
+## 6. Properties (RFC-5)
 
-Database device and properties (RFC-5/6), events (RFC-12), forwarded and
-memorized attributes, dynamic attributes, enum labels, access control,
-asynchronous (fire-and-forget) calls, binary encoding. The frame layer is
-isolated so JSON can later be swapped for a binary codec (CBOR, MessagePack)
-without touching the model.
+* A property is a named list of strings (a scalar is a list of one). Four
+  kinds exist: **class**, **device**, **attribute** (of a class or of a device)
+  and **free** (object + name). Pipe properties are attribute-like.
+* A device class declares its device properties:
+  `PropInfo = {name, data_type, description, default: [string] | null,
+  mandatory: bool}` (`Device::properties()`). `data_type` is one of the
+  RFC-5 recommended types (`Boolean`…`Double`, `String`, `*Array`).
+* At export (and at each `Init`) the server reads the device properties from
+  the Database, falls back to the declared default, fails the device
+  (`FAULT`, status naming the property) if a *mandatory* property is
+  missing, converts the strings to `data_type` and hands them to
+  `Device::init(&Properties)`.
+* Attribute properties stored in the Database (`description`, `label`,
+  `unit`, `format`, `min_value` … `max_warning`, the event properties of §9.3,
+  `__value` for memorised attributes) override the static ones at export;
+  ATTRIBUTE SET CONFIG writes them back to the Database.
+* Property names follow RFC-5 (`ALPHA *254(alphanum / "_")`; attribute
+  properties may start with `_`); others → `API_InvalidPropertyName`.
+
+## 7. Naming and Database (RFC-6)
+
+### 7.1 Device names and resolution
+
+```
+full-name  = [ "tango://" db-host ":" db-port "/" ] device [ "#dbase=no" ]
+device     = domain "/" family "/" member          ; RFC-2, case insensitive
+db-host    = <TANGO_HOST host>
+```
+
+* `sys/tg/1` resolves through the Database at `$TANGO_HOST`
+  (`host:port`, default port 10000).
+* `tango://db:10000/sys/tg/1` resolves through that Database.
+* `tango://host:port/sys/tg/1#dbase=no` is a direct connection, no Database
+  (Tango syntax); the transport is detected (`auto://`).
+* The endpoint URLs of §1 (`grpc://…/sys/tg/1`, …) stay valid and bypass
+  the Database.
+* Resolution = `DbImportDevice(device)` → `{exported, endpoint URL, …}`.
+  Not exported → `API_DeviceNotExported`. The client caches the endpoint and
+  re-imports once on `API_CommunicationFailed`.
+* **Aliases**: a name without `/` is a device alias, resolved with
+  `DbGetAliasDevice`; `alias/attribute` names an attribute.
+  Attribute aliases resolve with `DbGetAliasAttribute`.
+
+### 7.2 The Database device
+
+* The Database service is a device server, `DataBaseds`, instance `2`,
+  exporting the device `sys/database/2` (class `DataBase`) and its admin
+  device. It listens on the pre-known address `$TANGO_HOST` (all transports
+  through `auto://`). It has no class or device properties. It is ON while its
+  backend is reachable, FAULT otherwise.
+* Backend: **SQLite** (one file, `--db <path>`, default `tango.db`).
+  The schema mirrors the Tango MySQL schema: `device`, `server`,
+  `property_class`, `property_device`, `property_attribute_class`,
+  `property_attribute_device`, `property_pipe_class`, `property_pipe_device`,
+  `property`, `*_hist` history tables, `attribute_alias`, `event`.
+* Names are unique and validated (§6, RFC-2); sizes: device 255,
+  domain/family/member 85, alias 255.
+* Every command listed by RFC-6 is implemented, with the Tango argument types
+  (mostly `DevVarStringArray` and `DevVarLongStringArray` packed exactly as
+  the C++ `DataBaseds` does, so that the argument layouts of the Tango
+  documentation apply):
+
+| Group | Commands |
+|---|---|
+| Devices | `DbAddDevice`, `DbDeleteDevice`, `DbGetClassForDevice`, `DbGetClassInheritanceForDevice`, `DbGetDeviceClassList`, `DbGetDeviceDomainList`, `DbGetDeviceFamilyList`, `DbGetDeviceMemberList`, `DbGetDeviceInfo`, `DbGetDeviceList`, `DbGetDeviceWideList`, `DbGetDeviceServerClassList` |
+| Classes | `DbGetClassList` |
+| Class properties | `DbGetClassProperty`, `DbPutClassProperty`, `DbDeleteClassProperty`, `DbGetClassPropertyHist`, `DbGetClassPropertyList` |
+| Device properties | `DbGetDeviceProperty`, `DbPutDeviceProperty`, `DbDeleteDeviceProperty`, `DbGetDevicePropertyHist`, `DbGetDevicePropertyList` |
+| Class attribute properties | `DbGetClassAttributeProperty`, `…2`, `DbPutClassAttributeProperty`, `…2`, `DbDeleteClassAttributeProperty`, `DbGetClassAttributePropertyHist` |
+| Device attribute properties | `DbGetDeviceAttributeProperty`, `…2`, `DbPutDeviceAttributeProperty`, `…2`, `DbDeleteDeviceAttributeProperty`, `DbDeleteAllDeviceAttributeProperty`, `DbGetDeviceAttributePropertyHist` |
+| Pipe properties | `DbGetClassPipeProperty`, `DbPutClassPipeProperty`, `DbDeleteClassPipeProperty`, `DbGetClassPipePropertyHist`, `DbGetDevicePipeProperty`, `DbPutDevicePipeProperty`, `DbDeleteDevicePipeProperty`, `DbDeleteAllDevicePipeProperty`, `DbGetDevicePipePropertyHist` |
+| Free properties | `DbGetProperty`, `DbPutProperty`, `DbDeleteProperty`, `DbGetPropertyHist`, `DbGetPropertyList`, `DbGetObjectList` |
+| Attributes, pipes | `DbGetClassAttributeList`, `DbDeleteClassAttribute`, `DbGetDeviceAttributeList`, `DbDeleteDeviceAttribute`, `DbGetClassPipeList`, `DbDeleteClassPipe`, `DbGetDevicePipeList`, `DbDeleteDevicePipe` |
+| Aliases | `DbPutDeviceAlias`, `DbGetDeviceAlias`, `DbGetAliasDevice`, `DbDeleteDeviceAlias`, `DbGetDeviceAliasList`, `DbPutAttributeAlias`, `DbGetAttributeAlias`, `DbGetAttributeAlias2`, `DbGetAliasAttribute`, `DbDeleteAttributeAlias`, `DbGetAttributeAliasList` |
+| Hosts, servers | `DbAddServer`, `DbDeleteServer`, `DbRenameServer`, `DbGetServerList`, `DbGetServerNameList`, `DbGetInstanceNameList`, `DbGetHostList`, `DbGetHostServerList`, `DbGetHostServersInfo`, `DbGetServerInfo`, `DbPutServerInfo`, `DbDeleteServerInfo` |
+| Export | `DbExportDevice`, `DbUnExportDevice`, `DbUnExportServer`, `DbImportDevice`, `DbGetDeviceExportedList`, `DbGetExportedDeviceListForClass`, `DbExportEvent`, `DbImportEvent`, `DbUnExportEvent` |
+| Miscellaneous | `DbInfo`, `DbGetDataForServerCache`, `DbGetForwardedAttributeListForDevice`, `DbGetCSDbServerList`, `ResetTimingValues`, `DbMySqlSelect` (a read-only `SELECT` on the SQLite schema) |
+
+* Wildcards in list commands use `*` (translated to SQL `LIKE`). History
+  commands return the last 10 changes (Tango default).
+* `DbExportDevice` stores, in the `ior` column of Tango, the **endpoint URL**
+  of the device (e.g. `auto://host:10000`), with host, pid and version.
+
+### 7.3 Device server life cycle with a Database
+
+`Server::new(exec, instance)` with `$TANGO_HOST` set:
+
+1. `DbGetDeviceServerClassList` / `DbGetDeviceList(server, class)` give the
+   devices to create (devices can also be added in code; they are then
+   registered with `DbAddDevice`);
+2. properties are read (§6) and each device is initialised;
+3. `DbExportDevice` for each device and for the admin device, with the
+   endpoint URL the server listens on;
+4. on shutdown (`Kill`, SIGTERM, SIGINT): `DbUnExportServer`, then exit.
+
+Without `$TANGO_HOST`, or with `-nodb`, the server runs as today. With
+`-file=<path>` it reads devices and properties from a Database file (§7.4).
+
+### 7.4 Database as a file
+
+The RFC-6 file syntax is supported, read-only:
+`<server>/<instance>/DEVICE/<class>: dev1, dev2`,
+`<device>-><prop>: value`, `<device>/<attr>-><prop>: value`,
+`CLASS/<class>-><prop>: value`, `#` comments, `\` line continuation,
+`,` array separator, `"…"` quoted strings.
+
+## 8. Admin device (RFC-8)
+
+`dserver/<server>/<instance>`, class `DServer`, implements the RFC-8 command
+table:
+
+| Command | In → Out | Behaviour |
+|---|---|---|
+| `State`, `Status`, `Init` | | standard (Init re-initialises every device) |
+| `QueryClass`, `QueryDevice`, `QuerySubDevice` | Void → StringArray | classes; `class::device`; sub-devices (empty) |
+| `QueryWizardClassProperty`, `QueryWizardDevProperty` | String → StringArray | `[name, description, default]` triples from `PropInfo` |
+| `AddObjPolling`, `RemObjPolling`, `UpdObjPollingPeriod` | LongStringArray / StringArray | runtime polling configuration, persisted as the `polled_attr` / `polled_cmd` device properties |
+| `PolledDevice`, `DevPollStatus` | | polled devices; per object: period, ring depth, last read time and duration, last error |
+| `StartPolling`, `StopPolling` | Void → Void | |
+| `EventSubscriptionChange`, `ZmqEventSubscriptionChange`, `EventConfirmSubscription` | §9.2 | event negotiation |
+| `DevRestart` | String → Void | re-creates one device (unexport, drop, create, init, export) |
+| `RestartServer` | Void → Void | re-creates every device |
+| `Kill` | Void → Void | replies, then shuts the server down (§7.3 step 4) |
+| `LockDevice`, `UnLockDevice`, `ReLockDevices`, `DevLockStatus` | | device locking: a locked device refuses writes and commands from other clients (`API_DeviceLocked`); a lock expires after its validity |
+| `AddLoggingTarget`, `RemoveLoggingTarget`, `GetLoggingTarget`, `GetLoggingLevel`, `SetLoggingLevel`, `StartLogging`, `StopLogging` | | per-device log levels and targets (`console::`, `file::<path>`, `device::<name>`), RFC-14 levels OFF…DEBUG |
+
+## 9. Events (RFC-12)
+
+### 9.1 Event types and triggers
+
+| Event type | Fired when (RFC-4 properties) |
+|---|---|
+| `CHANGE_EVENT` | polled value moves by more than `abs_change` or `rel_change` (%) since the last event, or quality changes, or a read error appears or clears |
+| `PERIODIC_EVENT` | every `period` ms (default 1000) of polling |
+| `ARCHIVE_EVENT` | `archive_abs_change` / `archive_rel_change` exceeded, or `archive_period` elapsed |
+| `USER_EVENT` | pushed by device code (`DeviceContext::push_event`) |
+| `ATTR_CONF_EVENT` | ATTRIBUTE SET CONFIG (or a property change in the Database) |
+| `DATA_READY_EVENT` | pushed by device code, carries a counter |
+| `INTERFACE_CHANGE_EVENT` | device (re)started, attributes/commands added or removed |
+| `PIPE_EVENT` | pushed by device code |
+
+* CHANGE, PERIODIC and ARCHIVE need the attribute to be polled, unless the
+  device declares it pushes them itself (`AttrInfo.events_by_code`).
+  Subscribing otherwise → `API_AttributePollingNotStarted`. A change or
+  archive subscription with none of the thresholds set →
+  `API_EventPropertiesNotSet`.
+* `abs_change`, `rel_change`, `period`, `archive_*` are new optional
+  attribute properties (`AttrInfo`), settable with ATTRIBUTE SET CONFIG.
+* On subscription the subscriber immediately receives one event holding the
+  current value (Tango "synchronous first event").
+
+### 9.2 Negotiation and channels
+
+1. The client executes on the admin device
+   `EventSubscriptionChange([device, attribute, "subscribe", event_type, client_version])`
+   (`ZmqEventSubscriptionChange` is accepted as a synonym).
+2. The admin replies `SUBSCRIPTION_INFO` as a `LongStringArray`:
+   `[version, heartbeat_period_s, confirm_period_s] ,
+   [heartbeat_endpoint, event_endpoint, event_channel, heartbeat_channel]`.
+3. The client connects to the event endpoint of the *same transport* as its
+   request-reply connection (table below) and listens on `event_channel`.
+4. The server publishes a heartbeat on `heartbeat_channel` every **9 s**.
+   No heartbeat for 3 periods → the client re-subscribes, and its callback
+   receives an `API_EventTimeout` error event.
+5. The client calls `EventConfirmSubscription([device, attribute, event_type, …])`
+   at least every **200 s**; the server drops subscriptions not confirmed for
+   **600 s**.
+6. `"unsubscribe"` as the action cancels; the server stops publishing when
+   no subscriber is left.
+
+Channel names: `<device>/<attribute>.<event_type in lower case>`, e.g.
+`sys/tg/1/double_scalar.change`; heartbeat: `dserver/<server>/<instance>.heartbeat`.
+
+| Transport | Event channel mapping |
+|---|---|
+| TCP JSON Lines | the client opens a second connection to the event endpoint and sends `{"subscribe": [channel, …]}`; the server streams `{"channel", "seq", "event"}` lines |
+| ZeroMQ | `PUB` socket (event endpoint) and heartbeat `PUB`; the ZeroMQ topic is the channel name; message = `[topic, json event]` |
+| gRPC | server-streaming `rpc Subscribe(SubscribeRequest{channels}) returns (stream Event)` on the same service |
+| Zenoh | publisher on key `tango/<device>/<attribute>/@event/<type>`; heartbeat on `tango/@heartbeat/<server>/<instance>`; the "endpoint" is the session itself |
+
+### 9.3 Event payload
+
+```
+Event = { channel, seq: u64, type: EventType, time,
+          data: {"Ok": AttrValue | AttrInfo | PipeValue
+                       | {"DataReady": {name, data_type, counter}}
+                       | {"Interface": {commands, attributes, started}} }
+              | {"Err": DevFailed} }
+```
+
+* `seq` is per channel and increases by one: a gap tells the client it
+  missed events, and its callback receives `API_MissedEvents`.
+* Buffers are bounded (1000 events per subscriber, Tango `zmq_sub_event_hwm`);
+  overflow drops the oldest events, which the client then sees as a gap.
+
+### 9.4 Client API
+
+```rust
+let id = dev.subscribe_event("double_scalar", EventType::Change, |e: Event| { … }).await?;
+let mut s = dev.event_stream("double_scalar", EventType::Change).await?;  // impl Stream<Item = Event>
+dev.unsubscribe_event(id).await?;
+```
+
+## 10. Starter (Tango `Starter` class)
+
+* One Starter runs per host as the device `tango/admin/<host>` (class
+  `Starter`, server `Starter/<host>`). It starts, stops and monitors the
+  device servers registered for its host in the Database
+  (`DbGetHostServersInfo`: server, controlled flag, startup level).
+* Device properties: `StartDsPath` (directories holding the executables),
+  `WaitForDriverStartup`, `InterStartupLevelWait` (s), `ServerStartupTimeout`
+  (s), `StartServersAtStartup` (bool), `LogFileHome`, `KeepLogFiles`.
+* A server is *running* when its admin device answers a ping, *starting*
+  until then (up to `ServerStartupTimeout`), *stopped* otherwise; a
+  controlled server that dies is reported (state `ALARM`) but not restarted
+  (Tango behaviour).
+
+| Command | In → Out | Behaviour |
+|---|---|---|
+| `DevStart` | String → Void | starts `<exec> <instance>` from `StartDsPath`, stdout/stderr to `LogFileHome/<exec>_<instance>.log` |
+| `DevStop` | String → Void | `Kill` on the server's admin device |
+| `HardKillServer` | String → Void | kills the process (SIGKILL) |
+| `DevStartAll` | Short → Void | starts every controlled server of a startup level, waiting `InterStartupLevelWait` between levels |
+| `DevStopAll` | Short → Void | stops every server of a level |
+| `DevGetRunningServers`, `DevGetStopServers` | Boolean (controlled only) → StringArray | |
+| `DevReadLog` | String → String | the server's log file (`"Starter"` = the Starter's own log) |
+| `UpdateServersInfo` | Void → Void | re-reads the Database |
+
+| Attribute | Type | Content |
+|---|---|---|
+| `HostState` | Short | 0 ON, 1 MOVING (a server starting), 2 ALARM (a controlled server stopped) |
+| `Servers` | StringArray | `name\tstate\tcontrolled\tlevel\tnb_instances` per server |
+| `RunningServers`, `StoppedServers` | StringArray | |
+
+Changes of `Servers` and `HostState` are pushed as CHANGE events.
+
+## 11. Out of scope
+
+Wire compatibility with CORBA Tango clients and servers, forwarded and
+dynamic attributes beyond what INTERFACE_CHANGE needs, enum labels editing,
+access control (RFC-18), memorised attribute service beyond `__value`
+(RFC-17), and a binary codec. See `docs/COMPLIANCE.md` for the status of
+every RFC requirement.
