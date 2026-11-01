@@ -2,9 +2,7 @@
 
 mod common;
 
-use common::DEV;
-use std::time::Duration;
-use trust::{DbFile, DeviceProxy, Server};
+use trust::DbFile;
 
 const FILE: &str = r#"
 # TgTest server definition
@@ -34,15 +32,20 @@ fn parse_rfc6_syntax() {
     assert_eq!(DbFile::parse("garbage line").unwrap_err().reason(), "API_DatabaseFileError");
 }
 
+#[cfg(feature = "tcp")]
 #[tokio::test(flavor = "multi_thread")]
 async fn server_from_file_and_arguments() {
+    use common::DEV;
+    use std::time::Duration;
+    use trust::{DeviceProxy, Server};
     let path = std::env::temp_dir().join(format!("trust-dbfile-{}.res", std::process::id()));
     std::fs::write(&path, FILE).unwrap();
     let port = common::free_port();
     let args = ["test".to_string(), format!("-file={}", path.display()), format!("-endpoint=tcp://127.0.0.1:{port}")];
     let server = Server::from_args("TgTest", args).unwrap().class("TgTest", || Box::new(common::TgTest::default()));
-    tokio::spawn(server.run_args());
+    let task = tokio::spawn(server.run_args());
     while tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+        assert!(!task.is_finished(), "server stopped: {:?}", task.await);
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     for dev in [DEV, "sys/tg/2"] {
