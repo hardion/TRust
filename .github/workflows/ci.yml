@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--features tcp"
+          - "--no-default-features --features zmq"
+          - "--no-default-features --features grpc"
+          - "--no-default-features --features zenoh"
+          - "--features detect,zmq"
+          - "--features full"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
+      - run: cargo test --no-fail-fast ${{ matrix.features }}

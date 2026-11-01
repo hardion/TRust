@@ -1,4 +1,4 @@
-# TRust — Tango Request-Reply over gRPC
+# TRust — Tango Request-Reply over pluggable transports
 
 Status: **Draft / Proof of Concept** — protocol version `1`.
 
@@ -6,7 +6,7 @@ TRust implements the Tango device model as defined by the
 [Tango RFCs](https://github.com/tango-controls/rfc) (RFC-2 Device, RFC-3
 Command, RFC-4 Attribute, RFC-7 Pipe, RFC-9 Data Types) and provides an
 implementation of **RFC-10 "The Request-Reply protocol"** that replaces the
-CORBA transport (RFC-11) by the gRPC service `tango.v1.Device` (protobuf envelope, JSON operation).
+CORBA transport (RFC-11) by pluggable transports: JSON Lines over TCP, ZeroMQ, gRPC and Zenoh, selected by Cargo feature, by URL scheme or by detection of the wire.
 
 The set of low-level requests is taken from the *Tango Request-Reply
 cheatsheet* ("Tango Request-Reply" spreadsheet, sheet `REQUEST-REPLY`).
@@ -19,35 +19,37 @@ described in RFC 2119.
 
 ---
 
-## 1. Transport — gRPC
+## 1. Transport
 
-* The server SHALL expose the unary gRPC service `tango.v1.Device/Call`
-  defined in [`proto/tango.proto`](../proto/tango.proto) (HTTP/2, plain text
-  in the PoC; TLS is a tonic option). One server process (Device Server,
-  RFC-8) MAY host any number of devices on the same endpoint.
-* The client URL is `grpc://host:port/domain/family/member`.
-* The *Request* envelope fields of §2.1 (`v`, `id`, `client`, `source`,
-  `device`) are protobuf fields; `op` is the JSON `Op` of §3 carried as
-  `bytes`. The *Reply* carries `id` and the JSON
-  `{"Ok": Data} | {"Err": DevFailed}` as `bytes`.
-* Tango errors (`DevFailed`) are part of the reply, never a gRPC status; a
-  non-OK gRPC status means a transport failure (`API_CommunicationFailed`).
-* Calls are multiplexed on one HTTP/2 connection and MAY complete in any
-  order; each call is independent. Access to one device SHALL be serialised
-  (Tango "by device" serialisation model).
-* The black box records the peer socket address.
-* Any gRPC language can drive a device from the `.proto`, e.g. Python:
+The frames of §2 are carried by one of several transports, selected by the
+scheme of the endpoint URL and compiled in with Cargo features. The
+comparison and the design live in [`TRANSPORTS.md`](TRANSPORTS.md).
 
-```python
-stub = tango_pb2_grpc.DeviceStub(grpc.insecure_channel("localhost:10000"))
-r = stub.Call(tango_pb2.Request(v=1, id=1, device="sys/tg/1", op=b'"DeviceName"'))
-json.loads(r.reply)  # {'Ok': {'String': 'sys/tg/1'}}
+| Scheme | Transport | Feature | Mapping |
+|---|---|---|---|
+| none, `tcp://`, `tango://` | JSON Lines over TCP | `tcp` (default) | one frame per `\n` terminated line, replies in request order |
+| `zmq+tcp://`, `zmq+ipc://` | ZeroMQ | `zmq` | `ROUTER` server, `REQ`/`DEALER` client, frame = last message part |
+| `grpc://` | gRPC | `grpc` | unary `tango.v1.Device/Call` (`proto/tango.proto`), protobuf envelope, JSON `op`/`reply` |
+| `zenoh://<locator>` | Zenoh | `zenoh` | queryable `tango/<device in lower case>`, frame = query payload |
+| `auto://` | wire detection | `detect` | server: one port for every compiled TCP-based wire; client: probe |
+
+Common rules:
+
+* A client URL is `<endpoint>/domain/family/member`; the device name is
+  always the last three `/`-separated segments.
+* A server MAY serve the same devices on several endpoints at once.
+* Each request receives exactly one reply. Transports that allow
+  concurrency (ZeroMQ `DEALER`, HTTP/2, Zenoh) MAY reorder replies, so
+  clients match them by `id`.
+* Access to one device SHALL be serialised (Tango "by device" serialisation
+  model): two requests never execute concurrently on the same device.
+* A scheme whose transport is not compiled in → `API_UnsupportedTransport`.
+* The plain TCP wire is human readable and can be driven with `nc`:
+
 ```
-
-Why the operation stays JSON: the Tango model (30 data types, 21
-operations) is defined once in Rust and the `.proto` stays 20 lines. A fully
-typed `.proto` (one `oneof` per `Op`/`Value`) is the natural next step if
-schema-checked clients matter more than code size.
+$ echo '{"v":1,"id":1,"device":"sys/tg/1","op":"DeviceName"}' | nc localhost 10000
+{"id":1,"reply":{"Ok":{"String":"sys/tg/1"}}}
+```
 
 ## 2. Frames
 

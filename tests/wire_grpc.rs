@@ -1,9 +1,14 @@
 //! Wire-level tests: the `tango.v1.Device` gRPC service driven with the bare generated stub,
 //! as a client in any other language would, without `DeviceProxy`.
+#![cfg(feature = "grpc")]
 
 mod common;
 
-use common::{DEV, start};
+async fn start() -> String {
+    common::start("grpc://127.0.0.1:{port}", "grpc://127.0.0.1:{port}").await
+}
+
+use common::DEV;
 use serde_json::{Value as Json, json};
 
 mod pb {
@@ -23,7 +28,7 @@ async fn call(client: &mut Client, v: u32, id: u64, op: &[u8]) -> (u64, Json) {
     (reply.id, serde_json::from_slice(&reply.reply).unwrap())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn generated_stub() {
     let mut c = client().await;
     assert_eq!(call(&mut c, 1, 7, br#""DeviceName""#).await, (7, json!({"Ok": {"String": DEV}})));
@@ -33,7 +38,7 @@ async fn generated_stub() {
     assert_eq!(r["Ok"]["Attributes"][0]["Ok"]["value"], json!({"State": "ON"}));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn protocol_errors() {
     let mut c = client().await;
     let (id, r) = call(&mut c, 1, 3, b"this is not json").await;
@@ -43,7 +48,7 @@ async fn protocol_errors() {
     assert_eq!(call(&mut c, 1, 5, br#""DevicePing""#).await, (5, json!({"Ok": "Void"})));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn calls_are_multiplexed_on_one_channel() {
     let c = client().await;
     let calls = (0..50u64).map(|i| {
@@ -64,7 +69,7 @@ async fn calls_are_multiplexed_on_one_channel() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn black_box_records_grpc_peer() {
     let url = start().await;
     let mut dev = trust::DeviceProxy::connect(&format!("{url}/{DEV}")).await.unwrap();

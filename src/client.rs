@@ -1,7 +1,7 @@
 //! Client side: `DeviceProxy`, one connection to one device.
 
-use crate::grpc::Link;
 use crate::protocol::*;
+use crate::transport::Link;
 use crate::types::*;
 use std::time::{Duration, Instant};
 
@@ -54,11 +54,13 @@ macro_rules! call {
 }
 
 impl DeviceProxy {
-    /// `url` is `<endpoint>/domain/family/member`, here `grpc://host:port/domain/family/member`.
+    /// `url` is `<endpoint>/domain/family/member`, the endpoint scheme choosing the transport:
+    /// `tcp://host:port`, `zmq+tcp://host:port`, `grpc://host:port`, `zenoh://tcp/host:7447`,
+    /// `zenoh://` (discovery), `auto://host:port` (probe), see `Scheme`.
     pub async fn connect(url: &str) -> DevResult<Self> {
         let (endpoint, device) = split_url(url)?;
-        let endpoint = endpoint.strip_prefix("grpc://").unwrap_or(endpoint);
-        Ok(Self { device: device.into(), source: Source::Dev, next_id: 0, link: Link::connect(endpoint).await? })
+        let link = Link::connect(endpoint, device).await?;
+        Ok(Self { device: device.into(), source: Source::Dev, next_id: 0, link })
     }
 
     pub fn set_source(&mut self, source: Source) {

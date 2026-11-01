@@ -1,11 +1,11 @@
 //! Device server: the `Device` trait, the transport-independent request handler, black box and polling.
 
 use crate::protocol::*;
+use crate::transport::Scheme;
 use crate::types::*;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use tokio::net::TcpListener;
 
 const BLACK_BOX_DEPTH: usize = 50;
 const POLL_RING_DEPTH: usize = 10;
@@ -420,9 +420,14 @@ impl Handler {
     pub fn call(&self, req: Request, peer: &str) -> Reply {
         Reply { id: req.id, reply: self.0.handle(req, peer) }
     }
+
+    /// Names (lower case) of the exported devices, the admin device included.
+    pub fn devices(&self) -> Vec<String> {
+        self.0.devices.keys().cloned().collect()
+    }
 }
 
-/// A device server (RFC-8): hosts devices on one gRPC endpoint.
+/// A device server (RFC-8): hosts devices on one or several endpoints.
 pub struct Server {
     exec: String,
     instance: String,
@@ -452,14 +457,38 @@ impl Server {
         self
     }
 
-    /// Serves the devices as the gRPC service `tango.v1.Device` forever.
-    pub async fn run(self, listener: TcpListener) -> DevResult<()> {
-        let handler = self.start(&listener.local_addr()?.ip().to_string())?;
-        crate::grpc::serve(listener, handler).await
+    /// Serves the devices on every endpoint URL at once, forever: `tcp://host:port`,
+    /// `zmq+tcp://host:port`, `grpc://host:port`, `zenoh://<locator>`, `auto://host:port`
+    /// (see `Scheme`). Fails at once if a scheme is not compiled in.
+    pub async fn run(self, endpoints: impl IntoIterator<Item = impl AsRef<str>>) -> DevResult<()> {
+        let endpoints: Vec<String> = endpoints.into_iter().map(|e| e.as_ref().to_owned()).collect();
+        for e in &endpoints {
+            Scheme::parse(e)?;
+        }
+        let handler = self.start(&endpoints.join(" "))?;
+        let mut servers = tokio::task::JoinSet::new();
+        for e in endpoints {
+            let handler = handler.clone();
+            servers.spawn(async move { crate::transport::serve(&e, handler).await });
+        }
+        while let Some(result) = servers.join_next().await {
+            result.map_err(|e| DevFailed::new("API_InternalError", e.to_string(), "Server::run"))??;
+        }
+        Ok(())
+    }
+
+    /// Serves the devices on a Zenoh session with a full Zenoh configuration (routers to join,
+    /// TLS, ...), when the `zenoh://<locator>` shorthand of `run` is not enough.
+    #[cfg(feature = "zenoh")]
+    pub async fn run_zenoh(self, config: zenoh::Config) -> DevResult<()> {
+        let session = crate::transport::zenoh::open(config).await?;
+        let handler = self.start(&session.zid().to_string())?;
+        crate::transport::zenoh::serve(session, handler).await
     }
 
     /// Initialises and exports the devices, starts polling and returns the request handler.
-    /// `host` is reported in DEVICE INFO. Must be called within a tokio runtime.
+    /// `host` is reported in DEVICE INFO. Must be called within a tokio runtime; `run` uses it,
+    /// a custom transport can use it directly.
     pub fn start(self, host: &str) -> DevResult<Handler> {
         let adm_name = format!("dserver/{}/{}", self.exec, self.instance);
         let mut classes: Vec<_> = self.devices.iter().map(|(_, d)| d.class_name()).collect();

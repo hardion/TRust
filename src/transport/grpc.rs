@@ -67,11 +67,16 @@ impl pb::device_server::Device for Service {
 }
 
 pub(crate) async fn serve(listener: TcpListener, handler: Handler) -> DevResult<()> {
+    serve_incoming(TcpListenerStream::new(listener), handler).await
+}
+
+/// Serves connections accepted elsewhere (wire detection).
+pub(crate) async fn serve_incoming<S>(incoming: S, handler: Handler) -> DevResult<()>
+where
+    S: tokio_stream::Stream<Item = std::io::Result<tokio::net::TcpStream>> + Send + 'static,
+{
     let service = pb::device_server::DeviceServer::new(Service(handler));
-    tonic::transport::Server::builder()
-        .add_service(service)
-        .serve_with_incoming(TcpListenerStream::new(listener))
-        .await?;
+    tonic::transport::Server::builder().add_service(service).serve_with_incoming(incoming).await?;
     Ok(())
 }
 
