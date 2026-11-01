@@ -26,6 +26,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.features }}
-      - run: cargo fmt --check
+      - run: cargo fmt --all --check
       - run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
       - run: cargo test --no-fail-fast ${{ matrix.features }}
+
+  databaseds:
+    name: DataBaseds (SQLite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: databaseds
+      - run: cargo clippy -p trust-databaseds --all-targets -- -D warnings
+      - run: cargo test --no-fail-fast -p trust-databaseds

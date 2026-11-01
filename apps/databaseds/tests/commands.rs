@@ -131,7 +131,10 @@ async fn class_properties() {
 async fn free_properties() {
     let mut db = fresh().await;
     cmd(&mut db, "DbPutProperty", sa(&["Global", "1", "site", "2", "lab", "hall"])).await;
-    assert_eq!(list(&mut db, "DbGetProperty", sa(&["Global", "site"])).await, ["Global", "1", "site", "2", "lab", "hall"]);
+    assert_eq!(
+        list(&mut db, "DbGetProperty", sa(&["Global", "site"])).await,
+        ["Global", "1", "site", "2", "lab", "hall"]
+    );
     assert_eq!(list(&mut db, "DbGetPropertyList", sa(&["Global", "*"])).await, ["site"]);
     assert_eq!(list(&mut db, "DbGetObjectList", Value::String("*".into())).await, ["Global"]);
     cmd(&mut db, "DbDeleteProperty", sa(&["Global", "site"])).await;
@@ -209,7 +212,8 @@ async fn attribute_and_pipe_properties() {
     attribute_like(&mut db, "TgTest", "blob", class_pipe).await;
 
     // version 1 layouts: one value per property, no value count
-    cmd(&mut db, "DbPutDeviceAttributeProperty", sa(&["sys/tg/1", "1", "position", "2", "unit", "mm", "label", "Pos"])).await;
+    cmd(&mut db, "DbPutDeviceAttributeProperty", sa(&["sys/tg/1", "1", "position", "2", "unit", "mm", "label", "Pos"]))
+        .await;
     assert_eq!(
         list(&mut db, "DbGetDeviceAttributeProperty", sa(&["sys/tg/1", "position"])).await,
         ["sys/tg/1", "1", "position", "2", "label", "Pos", "unit", "mm"]
@@ -280,7 +284,10 @@ async fn export_and_import() {
     cmd(&mut db, "DbUnExportServer", s("TgTest/test")).await;
     assert_eq!(cmd(&mut db, "DbImportDevice", s("sys/tg/1")).await, expected(0));
     assert_eq!(err(&mut db, "DbImportDevice", s("no/such/device")).await, "DB_DeviceNotDefined");
-    assert_eq!(err(&mut db, "DbExportDevice", sa(&["no/such/device", "x", "h", "1", "1"])).await, "DB_DeviceNotDefined");
+    assert_eq!(
+        err(&mut db, "DbExportDevice", sa(&["no/such/device", "x", "h", "1", "1"])).await,
+        "DB_DeviceNotDefined"
+    );
 
     cmd(&mut db, "DbExportEvent", sa(&["sys/tg/1", "tcp://h:2", "hosta", "1234", "1"])).await;
     let ev = |e: i32| {

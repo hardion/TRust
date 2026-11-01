@@ -11,10 +11,10 @@ of `docs/PLAN.md` §Phase 2), ⛔ out of scope (with reason).
 | Class with commands, attributes, pipes | ✅ |
 | Init, State, Status commands; State, Status attributes | ✅ |
 | Default state UNKNOWN; ON + attribute in ALARM/WARNING → ALARM | ✅ |
-| Exported / not exported phases, init at export | ✅ without Database · 🔨 M1 with Database |
-| Device and class properties | 🔨 M1 |
+| Exported / not exported phases, init at export | ✅ |
+| Device and class properties | ✅ |
 | Dynamic attributes and commands (RFC-15) | 🔨 M3 (needed by INTERFACE_CHANGE) |
-| Reserved names `dserver/*`, classes `DServer`, `DataBase` | ✅ `dserver` · 🔨 M1 `DataBase` |
+| Reserved names `dserver/*`, classes `DServer`, `DataBase` | ✅ |
 
 ## RFC-3 Command
 
@@ -36,26 +36,26 @@ of `docs/PLAN.md` §Phase 2), ⛔ out of scope (with reason).
 | Memorized attributes (`__value`) | 🔨 M3 (with the Database) |
 | Enum labels | 🔨 M3 (display/edit in the browser) |
 | Forwarded attributes (`__root_att`) | ⛔ needs device-to-device proxying; later phase |
-| Attribute aliases | 🔨 M1 |
+| Attribute aliases | ✅ (Database; client-side resolution of `alias` attribute names 🔨 M3) |
 
 ## RFC-5 Property
 
 | Requirement | Status |
 |---|---|
-| Class, device, attribute, free properties | 🔨 M1 |
-| Default value, mandatory in Database, types | 🔨 M1 |
-| Naming convention | 🔨 M1 |
+| Class, device, attribute, free properties | ✅ |
+| Default value, mandatory in Database, types | ✅ |
+| Naming convention | ✅ |
 
 ## RFC-6 Database
 
 | Requirement | Status |
 |---|---|
-| Implemented as a device server, pre-known address, State/Status | 🔨 M1 |
-| SQL backend (SQLite) | 🔨 M1 |
-| Every command of the RFC-6 list (§7.2 of SPEC) | 🔨 M1 |
-| Property history | 🔨 M1 |
-| Uniqueness and naming checks, field sizes | 🔨 M1 |
-| Database as a file (read-only) | 🔨 M1 |
+| Implemented as a device server, pre-known address, State/Status | ✅ |
+| SQL backend (SQLite) | ✅ |
+| Every command of the RFC-6 list (§7.2 of SPEC) | ✅ (`DbGetDataForServerCache` simplified) |
+| Property history | ✅ |
+| Uniqueness and naming checks, field sizes | ✅ |
+| Database as a file (read-only) | ✅ |
 | High availability (3500 req/s) | 🔨 M1 measured with `examples/bench`; replication ⛔ |
 
 ## RFC-7 Pipe
@@ -75,8 +75,8 @@ of `docs/PLAN.md` §Phase 2), ⛔ out of scope (with reason).
 | Admin device name `dserver/<server>/<instance>` | ✅ |
 | Black box | ✅ |
 | Per-device serialisation | ✅ |
-| Admin command table (polling, events, restart, kill, locking, logging) | ✅ QueryClass/QueryDevice · 🔨 M1 lifecycle · 🔨 M2 events · 🔨 M3 the rest |
-| Export / unexport sequences with the Database | 🔨 M1 |
+| Admin command table (polling, events, restart, kill, locking, logging) | ✅ QueryClass, QueryDevice, Kill · 🔨 M2 events · 🔨 M3 the rest |
+| Export / unexport sequences with the Database | ✅ |
 
 ## RFC-9 Data types
 

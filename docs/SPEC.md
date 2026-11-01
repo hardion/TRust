@@ -283,11 +283,13 @@ db-host    = <TANGO_HOST host>
   device. It listens on the pre-known address `$TANGO_HOST` (all transports
   through `auto://`). It has no class or device properties. It is ON while its
   backend is reachable, FAULT otherwise.
-* Backend: **SQLite** (one file, `--db <path>`, default `tango.db`).
-  The schema mirrors the Tango MySQL schema: `device`, `server`,
-  `property_class`, `property_device`, `property_attribute_class`,
-  `property_attribute_device`, `property_pipe_class`, `property_pipe_device`,
-  `property`, `*_hist` history tables, `attribute_alias`, `event`.
+* Backend: **SQLite**, one file (`DataBaseds 2 -db=<path>`, default `tango.db`;
+  `-endpoint=<url>`, default `auto://0.0.0.0:10000`). Tables: `device`
+  (with alias and export columns), `server` (host, controlled mode, startup
+  level), `attribute_alias`, `event`, and **one** `property` table for the
+  seven property kinds (`device`, `class`, `free`, `device_attr`,
+  `class_attr`, `device_pipe`, `class_pipe`) with its `property_hist`
+  history. One table and one code path serve all the property commands.
 * Names are unique and validated (§6, RFC-2); sizes: device 255,
   domain/family/member 85, alias 255.
 * Every command listed by RFC-6 is implemented, with the Tango argument types
@@ -311,10 +313,37 @@ db-host    = <TANGO_HOST host>
 | Export | `DbExportDevice`, `DbUnExportDevice`, `DbUnExportServer`, `DbImportDevice`, `DbGetDeviceExportedList`, `DbGetExportedDeviceListForClass`, `DbExportEvent`, `DbImportEvent`, `DbUnExportEvent` |
 | Miscellaneous | `DbInfo`, `DbGetDataForServerCache`, `DbGetForwardedAttributeListForDevice`, `DbGetCSDbServerList`, `ResetTimingValues`, `DbMySqlSelect` (a read-only `SELECT` on the SQLite schema) |
 
-* Wildcards in list commands use `*` (translated to SQL `LIKE`). History
-  commands return the last 10 changes (Tango default).
+* Wildcards in list commands use `*` (translated to SQL `LIKE`). Names are
+  matched case-insensitively.
+* Argument layouts (C++ DataBaseds):
+
+| Commands | Argument | Reply |
+|---|---|---|
+| `DbPut{Device,Class}Property`, `DbPutProperty` | `[obj, n, (name, count, values…)*]` | |
+| `DbGet{Device,Class}Property`, `DbGetProperty` | `[obj, name…]` | `[obj, n, (name, count, values…)*]` (count 0 if unset) |
+| `Db*PropertyHist` | `[obj, name wildcard]` | `[(name, date, count, values…)*]`, oldest first, last 10 per property, a deletion has count 0 |
+| `DbPut{Device,Class}AttributeProperty2`, `Db*PipeProperty` puts | `[obj, n_attr, (attr, n_props, (prop, count, values…)*)*]` | |
+| `DbGet{Device,Class}AttributeProperty2`, `Db*PipeProperty` gets | `[obj, attr…]` | `[obj, n_attr, (attr, n_props, (prop, count, values…)*)*]`, properties sorted |
+| `Db{Put,Get}{Device,Class}AttributeProperty` (v1) | same without `count` (one value) | |
+| `Db*AttributePropertyHist`, `Db*PipePropertyHist` | `[obj, attr, prop wildcard]` | `[(attr, prop, date, count, values…)*]` |
+| `DbImportDevice` | `device` | `LongStringArray([exported, pid], [name, endpoint, version, server, host, class])` |
+| `DbGetDeviceInfo` | `device` | `LongStringArray([exported, pid], [name, endpoint, version, server, host, started, stopped, class])` |
+| `DbExportDevice`, `DbExportEvent` | `[name, endpoint, host, pid, version]` | |
+| `DbImportEvent` | `name` | `LongStringArray([exported, pid], [name, endpoint, version, host])` |
+| `DbAddServer` | `[server, (device, class)*]` (adds `dserver/<server>` too) | |
+| `DbGetDeviceClassList` | `server` | `[(device, class)*]` |
+| `DbPutServerInfo` / `DbGetServerInfo` | `[server, host, mode, level]` | |
+| `DbGetHostServersInfo` | `host` | `[(server, mode, level)*]` |
+| `DbMySqlSelect` | one `SELECT` | `LongStringArray([rows, columns], values row by row)` |
+
 * `DbExportDevice` stores, in the `ior` column of Tango, the **endpoint URL**
   of the device (e.g. `auto://host:10000`), with host, pid and version.
+* `DbGetDataForServerCache` returns the server's `[(device, class)*]` (the
+  C++ cache bundle has no meaning without CORBA).
+* Errors: `DB_DeviceNotDefined`, `DB_IncorrectDeviceName`,
+  `DB_IncorrectServerName`, `DB_AliasAlreadyDefined`, `DB_AliasNotDefined`,
+  `DB_IncorrectArguments`, `DB_SQLError` (also for a non-`SELECT` in
+  `DbMySqlSelect`), `API_InvalidPropertyName`.
 
 ### 7.3 Device server life cycle with a Database
 
@@ -330,6 +359,14 @@ db-host    = <TANGO_HOST host>
 
 Without `$TANGO_HOST`, or with `-nodb`, the server runs as today. With
 `-file=<path>` it reads devices and properties from a Database file (§7.4).
+
+API: `Server::new(exec, instance)` with `.class(name, factory)` for the
+classes whose devices come from the Database, `.device(name, device)` for
+devices created in code, `.database(tango_host)`, `.nodb()`, `.db_file(path)`;
+or `Server::from_args(exec, args)` for
+`<instance> [-nodb] [-file=<path>] [-dbhost=<host:port>] [-endpoint=<url>]…`
+then `.run_args()`. `run` binds every endpoint first (port 0 picks a free port)
+and exports the devices with the first one; the admin device gains `Kill`.
 
 ### 7.4 Database as a file
 

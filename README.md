@@ -8,7 +8,10 @@ by detection of the wire (one `auto://` port for every wire, client-side probing
 
 * [`docs/SPEC.md`](docs/SPEC.md): protocol specification (the 21 requests of the Tango Request-Reply cheatsheet)
 * [`docs/TRANSPORTS.md`](docs/TRANSPORTS.md): the transports compared, latency, and the abstraction
-* [`docs/PLAN.md`](docs/PLAN.md): the original plan and test matrix
+* [`docs/PLAN.md`](docs/PLAN.md): the plan, phase 1 and phase 2 milestones
+* [`docs/COMPLIANCE.md`](docs/COMPLIANCE.md): status of every Tango RFC requirement
+* [`docs/BROWSER.md`](docs/BROWSER.md): the device browser and Starter interface (phase 2)
+* `apps/databaseds`: the Database device `sys/database/2` (RFC-6) on SQLite
 * `tests/validation.rs`: the validation suite run over every compiled transport, directly and through detection
 * `tests/wire_*.rs`: each wire driven without `DeviceProxy`, plus selection and detection tests
 
@@ -26,7 +29,12 @@ cargo test --features full                     # 264 validation tests + wire tes
 cargo run --features full --example tgtest      # every wire on auto://127.0.0.1:10000
 echo '{"v":1,"id":1,"device":"sys/tg/1","op":"DeviceName"}' | nc -q1 127.0.0.1 10000
 cargo run --release --features full --example bench
+cargo run -p trust-databaseds --bin DataBaseds -- 2   # Database on auto://0.0.0.0:10000
+TANGO_HOST=localhost:10000 cargo run --features full --example tgtest auto://0.0.0.0:0   # registers and exports sys/tg/1
 ```
+
+With a Database, devices are named like in Tango: `sys/tg/1` (through `$TANGO_HOST`),
+`tango://host:10000/sys/tg/1`, an alias, or `tango://host:port/sys/tg/1#dbase=no` without it.
 
 Writing a device:
 

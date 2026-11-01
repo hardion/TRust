@@ -20,11 +20,13 @@ CLASS/TgTest->doc_url: "http://example.org/doc"
 #[test]
 fn parse_rfc6_syntax() {
     let f = DbFile::parse(FILE).unwrap();
-    assert_eq!(f.devices, [("TgTest/test".into(), "TgTest".into(), "sys/tg/1".into()), (
-        "TgTest/test".into(),
-        "TgTest".into(),
-        "sys/tg/2".into()
-    )]);
+    assert_eq!(
+        f.devices,
+        [
+            ("TgTest/test".into(), "TgTest".into(), "sys/tg/1".into()),
+            ("TgTest/test".into(), "TgTest".into(), "sys/tg/2".into())
+        ]
+    );
     assert_eq!(f.device_props[&("sys/tg/1".into(), "host".into())], ["my host"]);
     assert_eq!(f.device_props[&("sys/tg/1".into(), "ports".into())], ["10", "20", "30"]);
     assert_eq!(f.attr_props[&("sys/tg/1".into(), "double_scalar".into(), "label".into())], ["Position"]);

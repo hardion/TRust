@@ -26,8 +26,8 @@ async fn read(dev: &mut DeviceProxy, attr: &str) -> Value {
 #[tokio::test(flavor = "multi_thread")]
 async fn devices_and_properties_come_from_the_database() {
     let host = start_db().await;
-    let mut db = register(&host, &[("lab/motor/1", Some("COM1")), ("lab/motor/2", None), ("lab/motor/3", Some("X"))])
-        .await;
+    let mut db =
+        register(&host, &[("lab/motor/1", Some("COM1")), ("lab/motor/2", None), ("lab/motor/3", Some("X"))]).await;
     cmd(&mut db, "DbPutDeviceProperty", sa(&["lab/motor/1", "1", "Speed", "1", "3"])).await;
     cmd(&mut db, "DbPutClassProperty", sa(&["Motor", "1", "Speed", "1", "7"])).await;
     cmd(&mut db, "DbPutDeviceAttributeProperty2", sa(&["lab/motor/1", "1", "position", "1", "label", "1", "Pos"]))
@@ -77,8 +77,7 @@ async fn export_resolution_and_kill() {
     wait_exported(&mut db, "dserver/MotorServer/lab", true).await;
 
     // exported with the real port, not 0
-    let Value::LongStringArray(l, s) = cmd(&mut db, "DbImportDevice", Value::String("lab/motor/1".into())).await
-    else {
+    let Value::LongStringArray(l, s) = cmd(&mut db, "DbImportDevice", Value::String("lab/motor/1".into())).await else {
         panic!()
     };
     assert_eq!(l[1], std::process::id() as i32, "pid");
