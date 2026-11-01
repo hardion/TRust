@@ -137,13 +137,19 @@ pub fn free_port() -> u16 {
 
 /// Starts a server on `server` and returns `client`, `{port}` being replaced by a free port in both.
 pub async fn start(server: &str, client: &str) -> String {
-    let port = free_port().to_string();
-    let url = server.replace("{port}", &port);
-    tokio::spawn(async move { self::server().run([url]).await.unwrap() });
-    while tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await.is_err() {
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    loop {
+        let port = free_port().to_string();
+        let url = server.replace("{port}", &port);
+        let task = tokio::spawn(async move { self::server().run([url]).await });
+        while !task.is_finished() && tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if !task.is_finished() {
+            return client.replace("{port}", &port);
+        }
+        // another test took the port between free_port() and the bind: try another one
     }
-    client.replace("{port}", &port)
 }
 
 /// Zenoh peer listening on `locator`, without multicast scouting so that tests stay isolated.
