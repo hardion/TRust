@@ -145,11 +145,17 @@ pub fn zenoh_config(locator: &str) -> zenoh::Config {
 
 /// Starts a server on a random port and returns its endpoint URL (without the device name).
 pub async fn start() -> String {
-    let port = free_port();
-    let locator = format!("tcp/127.0.0.1:{port}");
-    tokio::spawn(server().run(zenoh_config(&locator)));
-    while tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err() {
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    loop {
+        let port = free_port();
+        let locator = format!("tcp/127.0.0.1:{port}");
+        let task = tokio::spawn(server().run(zenoh_config(&locator)));
+        while !task.is_finished() && tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if !task.is_finished() {
+            return format!("zenoh://{locator}");
+        }
+        // another test took the port between free_port() and the bind: try another one
     }
-    format!("zenoh://{locator}")
 }
