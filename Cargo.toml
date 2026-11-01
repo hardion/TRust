@@ -1,0 +1,11 @@
+[package]
+name = "trust"
+version = "0.1.0"
+edition = "2024"
+description = "PoC of a Tango-compatible control system: RFC device model over a simple socket request-reply protocol"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
