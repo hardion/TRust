@@ -1,5 +1,5 @@
-//! Runs the TgTest device server: `cargo run --example tgtest [addr]` (default 127.0.0.1:10000),
-//! then e.g. `echo '{"v":1,"id":1,"device":"sys/tg/1","op":"DeviceInfo"}' | nc -q1 127.0.0.1 10000`
+//! Runs the TgTest gRPC device server: `cargo run --example tgtest [addr]` (default 127.0.0.1:10000).
+//! Any gRPC client generated from `proto/tango.proto` can call `tango.v1.Device/Call`.
 
 #[path = "../tests/common/mod.rs"]
 mod common;
