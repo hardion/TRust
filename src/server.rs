@@ -1,12 +1,11 @@
-//! Device server: the `Device` trait, the request dispatcher, black box and polling.
+//! Device server: the `Device` trait, the transport-independent request handler, black box and polling.
 
 use crate::protocol::*;
 use crate::types::*;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
 const BLACK_BOX_DEPTH: usize = 50;
 const POLL_RING_DEPTH: usize = 10;
@@ -401,21 +400,20 @@ impl Ctx {
         push(&mut e.black_box, record, BLACK_BOX_DEPTH);
         e.handle(req.op, req.source, self)
     }
+}
 
-    async fn serve(self: Arc<Self>, stream: TcpStream) -> DevResult<()> {
-        let host = stream.peer_addr()?.to_string();
-        let (r, mut w) = stream.into_split();
-        let mut lines = BufReader::new(r).lines();
-        while let Some(line) = lines.next_line().await? {
-            let reply = match serde_json::from_str::<Request>(&line) {
-                Ok(req) => Reply { id: req.id, reply: self.handle(req, &host) },
-                Err(e) => Reply { id: 0, reply: Err(e.into()) },
-            };
-            let mut frame = serde_json::to_vec(&reply)?;
-            frame.push(b'\n');
-            w.write_all(&frame).await?;
-        }
-        Ok(())
+/// Transport-independent request handler: one encoded request frame in, one reply frame out.
+#[derive(Clone)]
+pub struct Handler(Arc<Ctx>);
+
+impl Handler {
+    /// `peer` identifies the client in the black box.
+    pub fn frame(&self, frame: &[u8], peer: &str) -> Vec<u8> {
+        let reply = match serde_json::from_slice::<Request>(frame) {
+            Ok(req) => Reply { id: req.id, reply: self.0.handle(req, peer) },
+            Err(e) => Reply { id: 0, reply: Err(e.into()) },
+        };
+        serde_json::to_vec(&reply).expect("a reply is always serialisable")
     }
 }
 
@@ -449,8 +447,15 @@ impl Server {
         self
     }
 
-    /// Initialises and exports the devices, starts polling and serves requests forever.
+    /// Serves the devices over TCP (JSON Lines) forever.
     pub async fn run(self, listener: TcpListener) -> DevResult<()> {
+        let handler = self.start(&listener.local_addr()?.ip().to_string())?;
+        crate::tcp::serve(listener, handler).await
+    }
+
+    /// Initialises and exports the devices, starts polling and returns the request handler.
+    /// `host` is reported in DEVICE INFO. Must be called within a tokio runtime.
+    pub fn start(self, host: &str) -> DevResult<Handler> {
         let adm_name = format!("dserver/{}/{}", self.exec, self.instance);
         let mut classes: Vec<_> = self.devices.iter().map(|(_, d)| d.class_name()).collect();
         classes.dedup();
@@ -487,12 +492,7 @@ impl Server {
             });
         }
 
-        let host = listener.local_addr()?.ip().to_string();
         let server_id = format!("{}/{}", self.exec, self.instance);
-        let ctx = Arc::new(Ctx { devices: entries, adm_name, server_id, host });
-        loop {
-            let (stream, _) = listener.accept().await?;
-            tokio::spawn(ctx.clone().serve(stream));
-        }
+        Ok(Handler(Arc::new(Ctx { devices: entries, adm_name, server_id, host: host.into() })))
     }
 }

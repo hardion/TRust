@@ -1,21 +1,18 @@
-//! Client side: `DeviceProxy`, one TCP connection to one device.
+//! Client side: `DeviceProxy`, one connection to one device.
 
 use crate::protocol::*;
+use crate::tcp::Link;
 use crate::types::*;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 pub struct DeviceProxy {
     device: String,
     source: Source,
     next_id: u64,
-    reader: Lines<BufReader<OwnedReadHalf>>,
-    writer: OwnedWriteHalf,
+    link: Link,
 }
 
-fn bad_reply(what: impl std::fmt::Debug) -> DevFailed {
+pub(crate) fn bad_reply(what: impl std::fmt::Debug) -> DevFailed {
     DevFailed::new("API_CommunicationFailed", format!("unexpected reply {what:?}"), "DeviceProxy")
 }
 
@@ -25,6 +22,19 @@ fn strings(names: &[&str]) -> Vec<String> {
 
 fn pairs(values: &[(&str, Value)]) -> Vec<(String, Value)> {
     values.iter().map(|(n, v)| (n.to_string(), v.clone())).collect()
+}
+
+/// Splits `<endpoint>/domain/family/member`: the device name is always the last three segments.
+pub(crate) fn split_url(url: &str) -> DevResult<(&str, &str)> {
+    let cut = url.char_indices().filter(|(_, c)| *c == '/').map(|(i, _)| i).rev().nth(2);
+    match cut {
+        Some(i) if i > 0 => Ok((&url[..i], &url[i + 1..])),
+        _ => Err(DevFailed::new(
+            "API_InvalidArgs",
+            format!("expected <endpoint>/domain/family/member, got {url}"),
+            "url",
+        )),
+    }
 }
 
 /// Sends `$op` and extracts the `Data::$variant` payload (`()` for `Data::Void`).
@@ -44,19 +54,11 @@ macro_rules! call {
 }
 
 impl DeviceProxy {
-    /// `url` is `[tango://]host:port/domain/family/member`.
+    /// `url` is `<endpoint>/domain/family/member`, here `[tango://]host:port/domain/family/member`.
     pub async fn connect(url: &str) -> DevResult<Self> {
-        let url = url.strip_prefix("tango://").unwrap_or(url);
-        let Some((addr, device)) = url.split_once('/') else {
-            return Err(DevFailed::new(
-                "API_InvalidArgs",
-                format!("expected host:port/device, got {url}"),
-                "DeviceProxy",
-            ));
-        };
-        let (reader, writer) = TcpStream::connect(addr).await?.into_split();
-        let reader = BufReader::new(reader).lines();
-        Ok(Self { device: device.into(), source: Source::Dev, next_id: 0, reader, writer })
+        let (endpoint, device) = split_url(url)?;
+        let endpoint = endpoint.strip_prefix("tango://").unwrap_or(endpoint);
+        Ok(Self { device: device.into(), source: Source::Dev, next_id: 0, link: Link::connect(endpoint).await? })
     }
 
     pub fn set_source(&mut self, source: Source) {
@@ -66,11 +68,8 @@ impl DeviceProxy {
     async fn call(&mut self, op: Op) -> DevResult<Data> {
         self.next_id += 1;
         let (id, client, source, device) = (self.next_id, std::process::id() as u64, self.source, self.device.clone());
-        let mut frame = serde_json::to_vec(&Request { v: PROTOCOL_VERSION, id, client, source, device, op })?;
-        frame.push(b'\n');
-        self.writer.write_all(&frame).await?;
-        let line = self.reader.next_line().await?.ok_or_else(|| bad_reply("connection closed"))?;
-        let reply: Reply = serde_json::from_str(&line)?;
+        let frame = serde_json::to_vec(&Request { v: PROTOCOL_VERSION, id, client, source, device, op })?;
+        let reply: Reply = serde_json::from_slice(&self.link.call(frame).await?)?;
         if reply.id != id {
             return Err(bad_reply(reply));
         }
