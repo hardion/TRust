@@ -379,22 +379,67 @@ The RFC-6 file syntax is supported, read-only:
 ## 8. Admin device (RFC-8)
 
 `dserver/<server>/<instance>`, class `DServer`, implements the RFC-8 command
-table:
+table (argument layouts of the C++ `DServer`):
 
 | Command | In → Out | Behaviour |
 |---|---|---|
 | `State`, `Status`, `Init` | | standard (Init re-initialises every device) |
-| `QueryClass`, `QueryDevice`, `QuerySubDevice` | Void → StringArray | classes; `class::device`; sub-devices (empty) |
-| `QueryWizardClassProperty`, `QueryWizardDevProperty` | String → StringArray | `[name, description, default]` triples from `PropInfo` |
-| `AddObjPolling`, `RemObjPolling`, `UpdObjPollingPeriod` | LongStringArray / StringArray | runtime polling configuration, persisted as the `polled_attr` / `polled_cmd` device properties |
-| `PolledDevice`, `DevPollStatus` | | polled devices; per object: period, ring depth, last read time and duration, last error |
-| `StartPolling`, `StopPolling` | Void → Void | |
+| `QueryClass`, `QueryDevice`, `QuerySubDevice` | Void → StringArray | classes; `class::device`; sub-devices (always empty) |
+| `QueryWizardClassProperty`, `QueryWizardDevProperty` | String (class) → StringArray | `[name, description, default]*`; the default joins its values with `\n`, empty if none |
+| `AddObjPolling` | LongStringArray `([period_ms], [device, "attribute"\|"command", name])` → Void | polls the object; `API_AlreadyPolled` if it is |
+| `UpdObjPollingPeriod` | same → Void | new period; `API_NotPolled` if not polled |
+| `RemObjPolling` | StringArray `[device, type, name]` → Void | stops polling it |
+| `PolledDevice` | Void → StringArray | devices with polled objects |
+| `DevPollStatus` | String (device) → StringArray | one text block per polled object: `Polled attribute name = …\nPolling period (mS) = …\nPolling ring buffer depth = 10\nTime needed for the last attribute reading (mS) = …\nLast reading = …` (`command` for commands), plus the last error if any |
+| `StartPolling`, `StopPolling` | Void → Void | resume / pause every polling of the server |
 | `EventSubscriptionChange`, `ZmqEventSubscriptionChange`, `EventConfirmSubscription` | §9.2 | event negotiation |
-| `DevRestart` | String → Void | re-creates one device (unexport, drop, create, init, export) |
-| `RestartServer` | Void → Void | re-creates every device |
+| `DevRestart` | String (device) → Void | drops the device and creates it again from its class factory (`Server::class`), or re-initialises it if it has none; polling, locks and subscriptions stay; fires INTERFACE_CHANGE |
+| `RestartServer` | Void → Void | `DevRestart` of every device |
 | `Kill` | Void → Void | replies, then shuts the server down (§7.3 step 4) |
-| `LockDevice`, `UnLockDevice`, `ReLockDevices`, `DevLockStatus` | | device locking: a locked device refuses writes and commands from other clients (`API_DeviceLocked`); a lock expires after its validity |
-| `AddLoggingTarget`, `RemoveLoggingTarget`, `GetLoggingTarget`, `GetLoggingLevel`, `SetLoggingLevel`, `StartLogging`, `StopLogging` | | per-device log levels and targets (`console::`, `file::<path>`, `device::<name>`), RFC-14 levels OFF…DEBUG |
+| `LockDevice` | LongStringArray `([validity_s], [device])` → Void | locks the device for the calling client |
+| `ReLockDevices` | StringArray (devices) → Void | extends the caller's locks by their validity |
+| `UnLockDevice` | LongStringArray `([force], [device…])` → Long | releases; another client's lock needs `force = 1`, else `API_DeviceLocked`; returns the number released |
+| `DevLockStatus` | String (device) → LongStringArray | `([locked, owner client id, remaining s], [status text, owner host])` |
+| `AddLoggingTarget`, `RemoveLoggingTarget` | StringArray `[device, target]*` → Void | targets `console::` (stderr) and `file::<path>`; `*` as device = every device |
+| `GetLoggingTarget` | String (device) → StringArray | |
+| `SetLoggingLevel` | LongStringArray `([level…], [device…])` → Void | RFC-14 levels: 0 OFF, 1 FATAL, 2 ERROR, 3 WARN (default), 4 INFO, 5 DEBUG |
+| `GetLoggingLevel` | StringArray (devices) → LongStringArray `([level…], [device…])` | |
+| `StartLogging`, `StopLogging` | Void → Void | switch logging of the whole server on / off |
+
+* **Locks** belong to a client, identified by the `client` field of the
+  request (the process id by default; `DeviceProxy::lock` / `unlock` use the
+  proxy's). While a device is locked by another client, it answers
+  `API_DeviceLocked` to commands other than `State`, `Status`, to attribute
+  and pipe writes and to configuration changes; reads stay allowed.
+* **Logging**: every request to a device is logged at DEBUG
+  (`<time> DEBUG <device> <operation>`); device code logs through
+  `EventSink::log(level, message)`.
+* **Polling configuration** made with these commands is persisted in the
+  Database as the device properties `polled_attr` / `polled_cmd`
+  (`[name, period_ms]*`, Tango format), which the server reads at export, so
+  polling survives a restart.
+
+### 8.1 Attribute model completions (RFC-4, RFC-7, RFC-9, RFC-15)
+
+* **Memorised attributes**: `AttrInfo.memorized`. Each successful write
+  stores the value in the Database as the `__value` attribute property (JSON
+  of the `Value`); at export the server writes it back to the device
+  (RFC-4), so the set value survives a restart.
+* **Enumerations** (`DevEnum`): a `Short` attribute with non-empty
+  `AttrInfo.enum_labels`. A written value must index a label, else
+  `API_WAttrOutsideLimit`. The labels are an editable property.
+* **READ_WITH_WRITE**: `AttrInfo.writable_attr_name` names the writable
+  attribute whose set value becomes the `w_value` of this one.
+* **Nested pipe blobs**: `Value::PipeBlob(PipeBlob)` (RFC-9 `DevPipeBlob`) can
+  be a pipe element.
+* **Several write errors** (the RFC-9 MultiDevFailed): ATTRIBUTES WRITE
+  returns one `DevError` per failed attribute, its `origin` being the
+  attribute name.
+* **Dynamic attributes and commands** (RFC-15): a device changes the lists
+  returned by `attributes()` / `commands()` and calls
+  `EventSink::interface_changed()`; the server re-reads them after the
+  current request (keeping the configuration of the attributes it already
+  knew) and fires INTERFACE_CHANGE (`started: false`).
 
 ## 9. Events (RFC-12)
 

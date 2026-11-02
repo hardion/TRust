@@ -130,3 +130,34 @@ async fn devices_added_in_code_are_registered() {
     assert_eq!(list(&mut db, "DbGetDeviceList", sa(&["MotorServer/lab", "Motor"])).await, ["lab/motor/9"]);
     assert!(list(&mut db, "DbGetHostList", Value::String("*".into())).await.len() == 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memorized_values_and_polling_survive_a_restart() {
+    let host = start_db().await;
+    let mut db = register(&host, &[("lab/motor/1", Some("COM1"))]).await;
+    let first = tokio::spawn(motor_server(&host).run(["auto://127.0.0.1:0"]));
+    wait_exported(&mut db, "lab/motor/1", true).await;
+    let mut m = DeviceProxy::connect(&format!("tango://{host}/lab/motor/1")).await.unwrap();
+    let mut admin = DeviceProxy::connect(&format!("tango://{host}/dserver/MotorServer/lab")).await.unwrap();
+
+    let wizard = admin.command_inout("QueryWizardDevProperty", Value::String("Motor".into())).await.unwrap();
+    assert_eq!(wizard, sa(&["Speed", "max speed", "1.5", "Port", "", ""]));
+
+    m.write_attribute("position", Value::Double(4.0)).await.unwrap();
+    let props = list(&mut db, "DbGetDeviceAttributeProperty2", sa(&["lab/motor/1", "position"])).await;
+    assert!(props.contains(&"__value".into()), "{props:?}");
+    let poll = Value::LongStringArray(vec![50], ["lab/motor/1", "attribute", "position"].map(String::from).to_vec());
+    admin.command_inout("AddObjPolling", poll).await.unwrap();
+    let polled = list(&mut db, "DbGetDeviceProperty", sa(&["lab/motor/1", "polled_attr"])).await;
+    assert_eq!(polled, ["lab/motor/1", "1", "polled_attr", "2", "position", "50"]);
+
+    admin.command_inout("Kill", Value::Void).await.unwrap();
+    first.await.unwrap().unwrap();
+    tokio::spawn(motor_server(&host).run(["auto://127.0.0.1:0"]));
+    wait_exported(&mut db, "lab/motor/1", true).await;
+    let mut m = DeviceProxy::connect(&format!("tango://{host}/lab/motor/1")).await.unwrap();
+    let v = m.read_attribute("position").await.unwrap();
+    assert_eq!((v.value, v.w_value), (Value::Double(4.0), Some(Value::Double(4.0))), "memorized value written back");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!m.attribute_history("position", 1).await.unwrap().is_empty(), "polling restored");
+}
