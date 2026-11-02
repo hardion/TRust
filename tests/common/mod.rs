@@ -3,25 +3,30 @@
 
 use std::time::Duration;
 use trust::{
-    AttrInfo, CmdInfo, DataFormat as F, DataType as T, DevFailed, DevResult, DevState, Device, PipeBlob, PipeInfo,
-    Server, Value, Writable as W,
+    AttrInfo, CmdInfo, DataFormat as F, DataType as T, DevFailed, DevResult, DevState, Device, EventSink, EventType,
+    PipeBlob, PipeInfo, Server, Value, Writable as W,
 };
 
 pub const DEV: &str = "sys/tg/1";
 pub const POLL: Duration = Duration::from_millis(20);
+/// Short event timings so that heartbeat loss is seen in tests.
+pub const HEARTBEAT: Duration = Duration::from_millis(100);
 
 pub struct TgTest {
     double: f64,
     string: String,
     counter: i32,
+    ramp: f64,
     blob: PipeBlob,
+    events: Option<EventSink>,
 }
 
 impl Default for TgTest {
     fn default() -> Self {
         let elements =
             vec![("x".into(), Value::Double(1.0)), ("names".into(), Value::StringArray(vec!["a".into(), "b".into()]))];
-        Self { double: 0.0, string: String::new(), counter: 0, blob: PipeBlob { name: "data".into(), elements } }
+        let blob = PipeBlob { name: "data".into(), elements };
+        Self { double: 0.0, string: String::new(), counter: 0, ramp: 0.0, blob, events: None }
     }
 }
 
@@ -46,6 +51,9 @@ impl Device for TgTest {
     fn commands(&self) -> Vec<CmdInfo> {
         vec![
             cmd("DevVoid", T::Void, T::Void),
+            cmd("PushUser", T::Void, T::Void),
+            cmd("PushDataReady", T::Long, T::Void),
+            cmd("PushPipe", T::Void, T::Void),
             cmd("DevDouble", T::Double, T::Double),
             cmd("DevString", T::String, T::String),
             cmd("DevVarLongArray", T::LongArray, T::LongArray),
@@ -66,7 +74,12 @@ impl Device for TgTest {
             AttrInfo { max_dim_x: 10, ..attr("long_spectrum", T::Long, F::Spectrum, W::Read) },
             AttrInfo { max_dim_x: 2, max_dim_y: 2, ..attr("short_image", T::Short, F::Image, W::Read) },
             attr("string_scalar", T::String, F::Scalar, W::ReadWrite),
-            attr("counter", T::Long, F::Scalar, W::Read),
+            AttrInfo { period: Some(100), ..attr("counter", T::Long, F::Scalar, W::Read) },
+            AttrInfo {
+                abs_change: Some(1.0),
+                archive_abs_change: Some(10.0),
+                ..attr("ramp", T::Double, F::Scalar, W::ReadWrite)
+            },
             attr("faulty", T::Double, F::Scalar, W::Read),
         ]
     }
@@ -76,9 +89,26 @@ impl Device for TgTest {
             PipeInfo { name: "ro_pipe".into(), ..Default::default() },
         ]
     }
+    fn attach(&mut self, events: EventSink) {
+        self.events = Some(events);
+    }
     fn execute(&mut self, cmd: &str, arg: Value) -> DevResult<Value> {
+        let sink = || self.events.clone().expect("attached at export");
         match cmd {
             "DevVoid" => Ok(Value::Void),
+            "PushUser" => {
+                sink().push_value("ramp", EventType::User, Value::String("pushed".into()))?;
+                Ok(Value::Void)
+            }
+            "PushDataReady" => {
+                let Value::Long(n) = arg else { unreachable!() };
+                sink().push_data_ready("ramp", n)?;
+                Ok(Value::Void)
+            }
+            "PushPipe" => {
+                sink().push_pipe("blob", self.blob.clone())?;
+                Ok(Value::Void)
+            }
             "Throw" => Err(DevFailed::new("TG_Thrown", "thrown on purpose", "TgTest::Throw")),
             "Counter" => {
                 self.counter += 1;
@@ -90,6 +120,7 @@ impl Device for TgTest {
     fn read_attribute(&mut self, attr: &str) -> DevResult<Value> {
         Ok(match attr {
             "double_scalar" => Value::Double(self.double),
+            "ramp" => Value::Double(self.ramp),
             "long_spectrum" => Value::LongArray(vec![1, 2, 3]),
             "short_image" => Value::ShortArray(vec![1, 2, 3, 4]),
             "string_scalar" => Value::String(self.string.clone()),
@@ -105,6 +136,7 @@ impl Device for TgTest {
     fn write_attribute(&mut self, attr: &str, value: Value) -> DevResult<()> {
         match (attr, value) {
             ("double_scalar", Value::Double(v)) => self.double = v,
+            ("ramp", Value::Double(v)) => self.ramp = v,
             ("string_scalar", Value::String(v)) => self.string = v,
             _ => unreachable!("type checked by the server"),
         }
@@ -126,6 +158,8 @@ pub fn server() -> Server {
     Server::new("TgTest", "test")
         .device(DEV, TgTest::default())
         .poll_attribute(DEV, "counter", POLL)
+        .poll_attribute(DEV, "ramp", POLL)
+        .heartbeat(HEARTBEAT)
         .poll_attribute(DEV, "faulty", POLL)
         .poll_command(DEV, "Counter", POLL)
 }

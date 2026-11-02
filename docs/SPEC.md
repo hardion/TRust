@@ -405,7 +405,7 @@ table:
 | `CHANGE_EVENT` | polled value moves by more than `abs_change` or `rel_change` (%) since the last event, or quality changes, or a read error appears or clears |
 | `PERIODIC_EVENT` | every `period` ms (default 1000) of polling |
 | `ARCHIVE_EVENT` | `archive_abs_change` / `archive_rel_change` exceeded, or `archive_period` elapsed |
-| `USER_EVENT` | pushed by device code (`DeviceContext::push_event`) |
+| `USER_EVENT` | pushed by device code (`EventSink`, below) |
 | `ATTR_CONF_EVENT` | ATTRIBUTE SET CONFIG (or a property change in the Database) |
 | `DATA_READY_EVENT` | pushed by device code, carries a counter |
 | `INTERFACE_CHANGE_EVENT` | device (re)started, attributes/commands added or removed |
@@ -419,7 +419,20 @@ table:
 * `abs_change`, `rel_change`, `period`, `archive_*` are new optional
   attribute properties (`AttrInfo`), settable with ATTRIBUTE SET CONFIG.
 * On subscription the subscriber immediately receives one event holding the
-  current value (Tango "synchronous first event").
+  current value (Tango "synchronous first event"). As in Tango, the client
+  produces it by reading the attribute (or its configuration, or the
+  interface) once its event connection is up, with `seq` 0, so it cannot be
+  lost.
+* Device code pushes USER, DATA_READY, PIPE events (and CHANGE/ARCHIVE for
+  `events_by_code` attributes) through the `EventSink` the server hands to
+  `Device::attach(sink)` at export: `sink.push_value(attr, EventType::User,
+  value)`, `sink.push_data_ready(attr, counter)`, `sink.push_pipe(pipe, blob)`.
+  Init fires INTERFACE_CHANGE (`started: true`).
+* Change and archive thresholds: an event fires when, for any element,
+  `|new - old| >= abs_change`, or `|new - old| / |old| * 100 >= rel_change`,
+  `old` being the value of the last event sent; also when the value changes
+  for a non-numeric type, when the quality or dimensions change, or when a
+  read error appears or clears.
 
 ### 9.2 Negotiation and channels
 
@@ -427,16 +440,19 @@ table:
    `EventSubscriptionChange([device, attribute, "subscribe", event_type, client_version])`
    (`ZmqEventSubscriptionChange` is accepted as a synonym).
 2. The admin replies `SUBSCRIPTION_INFO` as a `LongStringArray`:
-   `[version, heartbeat_period_s, confirm_period_s] ,
-   [heartbeat_endpoint, event_endpoint, event_channel, heartbeat_channel]`.
-3. The client connects to the event endpoint of the *same transport* as its
-   request-reply connection (table below) and listens on `event_channel`.
-4. The server publishes a heartbeat on `heartbeat_channel` every **9 s**.
-   No heartbeat for 3 periods → the client re-subscribes, and its callback
-   receives an `API_EventTimeout` error event.
-5. The client calls `EventConfirmSubscription([device, attribute, event_type, …])`
-   at least every **200 s**; the server drops subscriptions not confirmed for
-   **600 s**.
+   `[version, heartbeat_period_ms, confirm_period_ms],
+   [zmq_endpoint, event_channel, heartbeat_channel]`.
+3. The client receives the events over the *same transport* as its
+   request-reply connection (table below): on its request endpoint itself,
+   except ZeroMQ, which uses the PUB endpoint `zmq_endpoint` (empty when the
+   server serves no ZeroMQ).
+4. The server publishes a heartbeat on `heartbeat_channel` every
+   `heartbeat_period` (**9 s**, `Server::heartbeat`). No heartbeat for 3
+   periods → the client's stream receives an `API_EventTimeout` error event and
+   the client re-subscribes.
+5. The client calls `EventConfirmSubscription([device, attribute, event_type])`
+   every `confirm_period` (**200 s**); the server drops subscriptions not
+   confirmed for 3 confirm periods (**600 s**, `Server::event_confirm`).
 6. `"unsubscribe"` as the action cancels; the server stops publishing when
    no subscriber is left.
 
@@ -445,10 +461,10 @@ Channel names: `<device>/<attribute>.<event_type in lower case>`, e.g.
 
 | Transport | Event channel mapping |
 |---|---|
-| TCP JSON Lines | the client opens a second connection to the event endpoint and sends `{"subscribe": [channel, …]}`; the server streams `{"channel", "seq", "event"}` lines |
-| ZeroMQ | `PUB` socket (event endpoint) and heartbeat `PUB`; the ZeroMQ topic is the channel name; message = `[topic, json event]` |
-| gRPC | server-streaming `rpc Subscribe(SubscribeRequest{channels}) returns (stream Event)` on the same service |
-| Zenoh | publisher on key `tango/<device>/<attribute>/@event/<type>`; heartbeat on `tango/@heartbeat/<server>/<instance>`; the "endpoint" is the session itself |
+| TCP JSON Lines | the client opens a second connection to the same endpoint whose first line is `{"subscribe": [channel, …]}`; the server then streams one JSON `Event` per line |
+| ZeroMQ | one `PUB` socket per server (bound next to the ROUTER, port chosen by the system); the ZeroMQ topic is the channel name; message = `[channel, json Event]` |
+| gRPC | server-streaming `rpc Subscribe(SubscribeRequest{repeated string channels}) returns (stream EventFrame{bytes event})` on the same service |
+| Zenoh | the server puts each event on key `tango/event/<channel>` (e.g. `tango/event/sys/tg/1/ramp.change`); clients subscribe to those keys on their session |
 
 ### 9.3 Event payload
 
@@ -461,17 +477,22 @@ Event = { channel, seq: u64, type: EventType, time,
 ```
 
 * `seq` is per channel and increases by one: a gap tells the client it
-  missed events, and its callback receives `API_MissedEvents`.
+  missed events, and its stream receives an `API_MissedEvents` error event
+  before the next one.
 * Buffers are bounded (1000 events per subscriber, Tango `zmq_sub_event_hwm`);
   overflow drops the oldest events, which the client then sees as a gap.
 
 ### 9.4 Client API
 
 ```rust
-let id = dev.subscribe_event("double_scalar", EventType::Change, |e: Event| { … }).await?;
-let mut s = dev.event_stream("double_scalar", EventType::Change).await?;  // impl Stream<Item = Event>
-dev.unsubscribe_event(id).await?;
+let mut events = dev.event_stream("double_scalar", EventType::Change).await?;
+while let Some(e) = events.recv().await { … }        // dropping the stream unsubscribes
+let sub = dev.subscribe_event("double_scalar", EventType::Change, |e: Event| { … }).await?;
+drop(sub);                                           // or sub.unsubscribe().await
 ```
+
+`INTERFACE_CHANGE` ignores the attribute name (use `""`); `PIPE` takes the
+pipe name.
 
 ## 10. Starter (Tango `Starter` class)
 
