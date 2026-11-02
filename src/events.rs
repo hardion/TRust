@@ -3,7 +3,8 @@
 
 use crate::types::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
@@ -60,6 +61,8 @@ impl EventType {
     }
 }
 
+// events travel behind an `Arc`: the size of the largest variant costs one allocation per event
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EventData {
     Attr(AttrValue),
@@ -137,6 +140,46 @@ pub(crate) struct Hub {
     /// The ZeroMQ PUB endpoint, when the server serves ZeroMQ.
     pub(crate) zmq_endpoint: Mutex<String>,
     heartbeats: Mutex<u64>,
+    /// Devices whose code announced a change of interface (dynamic attributes and commands).
+    interface_changed: Mutex<HashSet<String>>,
+    pub(crate) logging: Mutex<Logging>,
+}
+
+/// RFC-14 logging levels; a message is emitted if its level is at most the device's level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+pub enum LogLevel {
+    Off = 0,
+    Fatal = 1,
+    Error = 2,
+    #[default]
+    Warn = 3,
+    Info = 4,
+    Debug = 5,
+}
+
+impl LogLevel {
+    pub fn from_i32(n: i32) -> Option<Self> {
+        [Self::Off, Self::Fatal, Self::Error, Self::Warn, Self::Info, Self::Debug]
+            .get(usize::try_from(n).ok()?)
+            .copied()
+    }
+
+    pub fn name(self) -> &'static str {
+        ["OFF", "FATAL", "ERROR", "WARN", "INFO", "DEBUG"][self as usize]
+    }
+}
+
+/// The logging configuration of the server (RFC-14): per device a level and targets,
+/// `console::` or `file::<path>`.
+pub(crate) struct Logging {
+    pub(crate) enabled: bool,
+    pub(crate) devices: HashMap<String, (LogLevel, Vec<String>)>,
+}
+
+impl Logging {
+    pub(crate) fn device(&mut self, device: &str) -> &mut (LogLevel, Vec<String>) {
+        self.devices.entry(device.to_lowercase()).or_default()
+    }
 }
 
 impl Hub {
@@ -149,7 +192,41 @@ impl Hub {
             confirm,
             zmq_endpoint: Mutex::default(),
             heartbeats: Mutex::new(0),
+            interface_changed: Mutex::default(),
+            logging: Mutex::new(Logging { enabled: true, devices: HashMap::new() }),
         }
+    }
+
+    /// Emits `<time> LEVEL <device> <message>` on the targets of `device` if its level allows.
+    pub(crate) fn log(&self, device: &str, level: LogLevel, message: &str) {
+        let targets = {
+            let mut logging = self.logging.lock().unwrap_or_else(|p| p.into_inner());
+            if !logging.enabled || level == LogLevel::Off {
+                return;
+            }
+            match logging.device(device) {
+                (max, targets) if level <= *max && !targets.is_empty() => targets.clone(),
+                _ => return,
+            }
+        };
+        let line = format!("{:.6} {} {device} {message}\n", now(), level.name());
+        for t in targets {
+            if let Some(path) = t.strip_prefix("file::") {
+                let file = std::fs::OpenOptions::new().create(true).append(true).open(path);
+                let _ = file.and_then(|mut f| f.write_all(line.as_bytes()));
+            } else {
+                eprint!("{line}");
+            }
+        }
+    }
+
+    pub(crate) fn interface_changed(&self, device: &str) {
+        self.interface_changed.lock().unwrap_or_else(|p| p.into_inner()).insert(device.to_lowercase());
+    }
+
+    /// Whether `device` announced a change of interface since the last call.
+    pub(crate) fn take_interface_changed(&self, device: &str) -> bool {
+        self.interface_changed.lock().unwrap_or_else(|p| p.into_inner()).remove(&device.to_lowercase())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Channel>> {
@@ -249,6 +326,18 @@ impl EventSink {
     pub fn push_data_ready(&self, attr: &str, counter: i32) -> DevResult<()> {
         let data = EventData::DataReady { name: attr.into(), data_type: DataType::Void, counter };
         self.push(attr, EventType::DataReady, Ok(data))
+    }
+
+    /// Logs a message of the device (RFC-14), on its targets if its level allows.
+    pub fn log(&self, level: LogLevel, message: &str) {
+        self.hub.log(&self.device, level, message);
+    }
+
+    /// Announces that `commands()`/`attributes()`/`pipes()` changed (dynamic attributes and
+    /// commands, RFC-15): the server re-reads them after the current request and sends
+    /// INTERFACE_CHANGE.
+    pub fn interface_changed(&self) {
+        self.hub.interface_changed(&self.device);
     }
 
     pub fn push_pipe(&self, pipe: &str, blob: PipeBlob) -> DevResult<()> {

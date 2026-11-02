@@ -334,6 +334,23 @@ impl DeviceProxy {
         call!(self, Op::DeviceAdmName, String)
     }
 
+    /// Locks the device for this client (process) for `validity` (at least 1 s), renewed by
+    /// another `lock`: other clients can only read it and run State and Status (RFC-8).
+    pub async fn lock(&mut self, validity: Duration) -> DevResult<()> {
+        let arg = Value::LongStringArray(vec![validity.as_secs().max(1) as i32], vec![self.device.clone()]);
+        self.admin_command("LockDevice", arg).await.map(drop)
+    }
+
+    pub async fn unlock(&mut self) -> DevResult<()> {
+        self.admin_command("UnLockDevice", Value::LongStringArray(vec![0], vec![self.device.clone()])).await.map(drop)
+    }
+
+    /// A command of the device's admin device, sent with this proxy's client id.
+    async fn admin_command(&mut self, cmd: &str, arg: Value) -> DevResult<Value> {
+        let adm = self.adm_name().await?;
+        Self::direct(&self.endpoint, &adm).await?.command_inout(cmd, arg).await
+    }
+
     /// Round trip time.
     pub async fn ping(&mut self) -> DevResult<Duration> {
         let start = Instant::now();

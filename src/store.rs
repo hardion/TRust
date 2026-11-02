@@ -50,24 +50,33 @@ impl Store {
         Ok(class_props)
     }
 
-    /// `properties` from synchronous code (the Init command): runs on a short-lived thread with
-    /// its own runtime and Database connection, so it works whatever runtime called it.
+    /// `properties` from synchronous code (the Init command).
     pub(crate) fn properties_blocking(&self, device: &str, class: &str, names: &[String]) -> DevResult<Raw> {
+        self.blocking(|store| async move { store.properties(device, class, names).await })
+    }
+
+    /// Runs `f` from synchronous code on a short-lived thread with its own runtime and Database
+    /// connection, so it works whatever runtime called it, and returns its result.
+    fn blocking<T: Send, F, Fut>(&self, f: F) -> DevResult<T>
+    where
+        F: FnOnce(Store) -> Fut + Send,
+        Fut: std::future::Future<Output = DevResult<T>>,
+    {
         let store = self.clone();
-        let read = || {
+        let run = || {
             std::thread::scope(|scope| {
-                let worker = scope.spawn(|| -> DevResult<Raw> {
+                let worker = scope.spawn(|| -> DevResult<T> {
                     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
                     rt.block_on(async {
                         let store = match store {
                             Self::Db(_, host) => Self::Db(Database::connect(&host).await?, host),
                             other => other,
                         };
-                        store.properties(device, class, names).await
+                        f(store).await
                     })
                 });
                 worker.join().unwrap_or_else(|_| {
-                    Err(crate::types::DevFailed::new("API_InternalError", "property reader panicked", "Init"))
+                    Err(crate::types::DevFailed::new("API_InternalError", "Database worker panicked", "Store"))
                 })
             })
         };
@@ -75,9 +84,9 @@ impl Store {
         // them may be the reply we wait for (an in-process Database)
         match tokio::runtime::Handle::try_current() {
             Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(read)
+                tokio::task::block_in_place(run)
             }
-            _ => read(),
+            _ => run(),
         }
     }
 
@@ -120,10 +129,48 @@ impl Store {
             ("archive_abs_change", num(a.archive_abs_change)),
             ("archive_rel_change", num(a.archive_rel_change)),
             ("archive_period", a.archive_period.map(|v| vec![v.to_string()])),
+            ("enum_labels", (!a.enum_labels.is_empty()).then(|| a.enum_labels.clone())),
         ]
         .map(|(n, v)| (n.to_string(), v));
         let (db, device, attr) = (db.clone(), device.to_string(), a.name.clone());
         tokio::spawn(async move { db.put_attribute_properties(&device, &attr, &props).await });
+    }
+}
+
+impl Store {
+    /// Stores the set value of a memorized attribute as its `__value` property (JSON), before
+    /// the write returns.
+    pub(crate) fn save_memorized(&self, device: &str, attr: &str, value: &crate::types::Value) -> DevResult<()> {
+        if !matches!(self, Self::Db(..)) {
+            return Ok(());
+        }
+        let props = [("__value".to_string(), Some(vec![serde_json::to_string(value)?]))];
+        self.blocking(|store| async move {
+            let Self::Db(db, _) = store else { return Ok(()) };
+            db.put_attribute_properties(device, attr, &props).await
+        })
+    }
+
+    /// Stores the polling configuration as the `polled_attr` / `polled_cmd` device properties
+    /// (`name, period_ms, ...`), before the admin command returns.
+    pub(crate) fn save_polling(&self, device: &str, attrs: Vec<String>, cmds: Vec<String>) -> DevResult<()> {
+        if !matches!(self, Self::Db(..)) {
+            return Ok(());
+        }
+        self.blocking(|store| async move {
+            let Self::Db(db, _) = store else { return Ok(()) };
+            for (name, values) in [("polled_attr", attrs), ("polled_cmd", cmds)] {
+                let (cmd, arg) = if values.is_empty() {
+                    ("DbDeleteDeviceProperty", vec![device.to_string(), name.into()])
+                } else {
+                    let mut a = vec![device.to_string(), "1".into(), name.into(), values.len().to_string()];
+                    a.extend(values);
+                    ("DbPutDeviceProperty", a)
+                };
+                db.command(cmd, crate::types::Value::StringArray(arg)).await?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -153,6 +200,9 @@ pub(crate) fn apply_attribute(a: &mut AttrInfo, props: &Raw) {
         if let Some(v) = num(name) {
             *field = Some(v);
         }
+    }
+    if let Some(labels) = props.get("enum_labels") {
+        a.enum_labels = labels.clone();
     }
     for (field, name) in [(&mut a.period, "period"), (&mut a.archive_period, "archive_period")] {
         if let Some(v) = num(name) {

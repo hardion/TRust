@@ -56,7 +56,8 @@ async fn polling_commands() {
     assert_eq!(polled, sa(&[DEV]));
 
     admin.command_inout("UpdObjPollingPeriod", obj(70)).await.unwrap();
-    let Value::StringArray(status) = admin.command_inout("DevPollStatus", Value::String(DEV.into())).await.unwrap() else {
+    let Value::StringArray(status) = admin.command_inout("DevPollStatus", Value::String(DEV.into())).await.unwrap()
+    else {
         panic!()
     };
     let ds = status.iter().find(|s| s.contains("Polled attribute name = double_scalar")).expect("double_scalar polled");
@@ -93,7 +94,10 @@ async fn restart() {
     dev.write_attribute("string_scalar", Value::String("again".into())).await.unwrap();
     admin.command_inout("RestartServer", Value::Void).await.unwrap();
     assert_eq!(dev.read_attribute("string_scalar").await.unwrap().value, Value::String("".into()));
-    assert_eq!(reason(admin.command_inout("DevRestart", Value::String("no/such/device".into())).await).await, "API_DeviceNotFound");
+    assert_eq!(
+        reason(admin.command_inout("DevRestart", Value::String("no/such/device".into())).await).await,
+        "API_DeviceNotFound"
+    );
 }
 
 /// One request with an explicit client id, on a raw connection.
@@ -124,7 +128,8 @@ async fn locking() {
     assert_eq!(raw(&url, 1, DEV, write(1.0)).await, json!({"Ok": "Void"}));
 
     let status = raw(&url, 2, ADMIN, cmd("DevLockStatus", json!({"String": DEV}))).await;
-    assert_eq!(status["Ok"]["Value"]["LongStringArray"][0][0..2], json!([1, 1]), "{status}");
+    let longs = &status["Ok"]["Value"]["LongStringArray"][0];
+    assert_eq!((&longs[0], &longs[1]), (&json!(1), &json!(1)), "locked, by client 1: {status}");
     let unlock = |force: i32| cmd("UnLockDevice", json!({"LongStringArray": [[force], [DEV]]}));
     assert_eq!(raw(&url, 2, ADMIN, unlock(0)).await["Err"][0]["reason"], "API_DeviceLocked");
     assert_eq!(raw(&url, 2, ADMIN, unlock(1)).await, json!({"Ok": {"Value": {"Long": 1}}}), "forced");
@@ -206,8 +211,10 @@ async fn read_with_write() {
 async fn nested_pipe_blob() {
     let (_, mut dev, _) = proxies().await;
     let inner = PipeBlob { name: "inner".into(), elements: vec![("y".into(), Value::LongArray(vec![1, 2]))] };
-    let blob =
-        PipeBlob { name: "outer".into(), elements: vec![("x".into(), Value::Double(1.0)), ("sub".into(), Value::PipeBlob(inner))] };
+    let blob = PipeBlob {
+        name: "outer".into(),
+        elements: vec![("x".into(), Value::Double(1.0)), ("sub".into(), Value::PipeBlob(inner))],
+    };
     assert_eq!(dev.write_read_pipe("blob", blob.clone()).await.unwrap().blob, blob);
 }
 
@@ -215,7 +222,11 @@ async fn nested_pipe_blob() {
 async fn one_error_per_failed_attribute() {
     let (_, mut dev, _) = proxies().await;
     let err = dev
-        .write_attributes(&[("nope", Value::Void), ("double_scalar", Value::Double(1.0)), ("long_spectrum", Value::Void)])
+        .write_attributes(&[
+            ("nope", Value::Void),
+            ("double_scalar", Value::Double(1.0)),
+            ("long_spectrum", Value::Void),
+        ])
         .await
         .unwrap_err();
     let origins: Vec<_> = err.0.iter().map(|e| e.origin.as_str()).collect();
