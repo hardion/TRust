@@ -1,8 +1,9 @@
 //! Client side: `DeviceProxy`, one connection to one device.
 
 use crate::db::{Database, database_endpoint, tango_host};
+use crate::events::{Event, EventData, EventStream, EventType, Sequence, Subscription};
 use crate::protocol::*;
-use crate::transport::Link;
+use crate::transport::{EventLink, Link};
 use crate::types::*;
 use std::time::{Duration, Instant};
 
@@ -11,8 +12,107 @@ pub struct DeviceProxy {
     source: Source,
     next_id: u64,
     link: Link,
+    /// The resolved endpoint URL of the link (no `auto://`), reused for events.
+    endpoint: String,
     /// `(TANGO_HOST, device)` when the device was resolved through a Database.
     resolved: Option<(String, String)>,
+}
+
+/// A live subscription: its admin device, event link and timings (SPEC §9.2).
+struct Watch {
+    admin: DeviceProxy,
+    link: Option<EventLink>,
+    url: String,
+    zmq: String,
+    channel: String,
+    beat: String,
+    heartbeat: Duration,
+    confirm: Duration,
+    subscribe: Value,
+    unsubscribe: Value,
+    confirm_args: Value,
+    event_type: EventType,
+    seq: Sequence,
+}
+
+impl Watch {
+    /// Connects the event link and waits until it carries a heartbeat (the confirm command makes
+    /// the server send one), so that no event published from now on can be missed. Returns the
+    /// events of the channel seen meanwhile.
+    async fn connect(&mut self) -> DevResult<Vec<Event>> {
+        let mut link = EventLink::connect(&self.url, &self.zmq, vec![self.channel.clone(), self.beat.clone()]).await?;
+        let mut early = vec![];
+        for _ in 0..100 {
+            self.admin.command_inout("EventConfirmSubscription", self.confirm_args.clone()).await?;
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+            while let Ok(e) = tokio::time::timeout_at(deadline, link.next()).await {
+                let e = e?;
+                if e.channel == self.beat {
+                    self.link = Some(link);
+                    return Ok(early);
+                }
+                early.push(e);
+            }
+        }
+        Err(DevFailed::new("API_EventTimeout", format!("no heartbeat on {}", self.beat), "event_stream"))
+    }
+
+    fn error(&self, reason: &str, desc: String) -> Event {
+        let data = Err(DevFailed::new(reason, desc, &self.channel));
+        Event { channel: self.channel.clone(), seq: 0, event_type: self.event_type, time: now(), data }
+    }
+
+    /// Sends an event to the stream, preceded by an `API_MissedEvents` error after a gap.
+    async fn deliver(&mut self, tx: &tokio::sync::mpsc::Sender<Event>, e: Event) -> bool {
+        let missed = self.seq.missed(e.seq);
+        if missed > 0 && tx.send(self.error("API_MissedEvents", format!("{missed} events missed"))).await.is_err() {
+            return false;
+        }
+        tx.send(e).await.is_ok()
+    }
+
+    /// Delivers events, watches heartbeats, confirms, re-subscribes; unsubscribes once the stream
+    /// is dropped.
+    async fn run(mut self, tx: tokio::sync::mpsc::Sender<Event>) {
+        let mut last_beat = tokio::time::Instant::now();
+        let mut confirm = tokio::time::interval(self.confirm);
+        confirm.tick().await;
+        loop {
+            let next = async {
+                match self.link.as_mut() {
+                    Some(link) => link.next().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                _ = tx.closed() => break,
+                e = next => match e {
+                    Ok(e) if e.channel == self.beat => last_beat = tokio::time::Instant::now(),
+                    Ok(e) => if !self.deliver(&tx, e).await { break },
+                    Err(_) => self.link = None, // wait for the heartbeat timeout
+                },
+                _ = tokio::time::sleep_until(last_beat + self.heartbeat * 3) => {
+                    let lost = self.error("API_EventTimeout", format!("no heartbeat on {}", self.beat));
+                    if tx.send(lost).await.is_err() {
+                        break;
+                    }
+                    last_beat = tokio::time::Instant::now();
+                    self.link = None;
+                    if self.admin.command_inout("EventSubscriptionChange", self.subscribe.clone()).await.is_ok()
+                        && let Ok(early) = self.connect().await
+                    {
+                        for e in early {
+                            self.deliver(&tx, e).await;
+                        }
+                    }
+                }
+                _ = confirm.tick() => {
+                    let _ = self.admin.command_inout("EventConfirmSubscription", self.confirm_args.clone()).await;
+                }
+            }
+        }
+        let _ = self.admin.command_inout("EventSubscriptionChange", self.unsubscribe.clone()).await;
+    }
 }
 
 pub(crate) fn bad_reply(what: impl std::fmt::Debug) -> DevFailed {
@@ -98,8 +198,9 @@ impl DeviceProxy {
 
     /// Connects to `device` at `endpoint`, without a Database.
     pub(crate) async fn direct(endpoint: &str, device: &str) -> DevResult<Self> {
-        let link = Link::connect(endpoint, device).await?;
-        Ok(Self { device: device.into(), source: Source::Dev, next_id: 0, link, resolved: None })
+        let endpoint = crate::transport::resolve(endpoint).await?;
+        let link = Link::connect(&endpoint, device).await?;
+        Ok(Self { device: device.into(), source: Source::Dev, next_id: 0, link, endpoint, resolved: None })
     }
 
     async fn resolve(host: &str, name: &str) -> DevResult<Self> {
@@ -107,6 +208,90 @@ impl DeviceProxy {
         let mut proxy = Self::direct(&endpoint, &device).await?;
         proxy.resolved = Some((host.into(), device));
         Ok(proxy)
+    }
+
+    /// Subscribes to the events of `name` (an attribute, a pipe for PIPE, `""` for
+    /// INTERFACE_CHANGE), SPEC §9. The first event is the current value; dropping the stream
+    /// unsubscribes.
+    pub async fn event_stream(&mut self, name: &str, event_type: EventType) -> DevResult<EventStream> {
+        let adm = self.adm_name().await?;
+        let mut admin = Self::direct(&self.endpoint, &adm).await?;
+        let args = |action: &str| {
+            let mut a =
+                vec![self.device.clone(), name.to_string(), action.to_string(), event_type.suffix().to_string()];
+            if action != "confirm" {
+                a.push("1".into());
+            } else {
+                a.remove(2);
+            }
+            Value::StringArray(a)
+        };
+        let Value::LongStringArray(l, s) = admin.command_inout("EventSubscriptionChange", args("subscribe")).await?
+        else {
+            return Err(bad_reply("SUBSCRIPTION_INFO"));
+        };
+        let (Some(heartbeat), Some(confirm), [zmq, channel, beat]) = (l.get(1), l.get(2), &s[..]) else {
+            return Err(bad_reply(s));
+        };
+        let ms = |v: i32| Duration::from_millis(v.max(1) as u64);
+        let mut sub = Watch {
+            admin,
+            link: None,
+            url: self.endpoint.clone(),
+            zmq: zmq.clone(),
+            channel: channel.clone(),
+            beat: beat.clone(),
+            heartbeat: ms(*heartbeat),
+            confirm: ms(*confirm),
+            subscribe: args("subscribe"),
+            unsubscribe: args("unsubscribe"),
+            confirm_args: args("confirm"),
+            event_type,
+            seq: Sequence::default(),
+        };
+        let early = sub.connect().await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::events::BUFFER);
+        if let Some(first) = self.first_event(name, event_type, channel).await {
+            sub.seq.missed(first.seq);
+            let _ = tx.send(first).await;
+        }
+        for e in early {
+            sub.deliver(&tx, e).await;
+        }
+        tokio::spawn(sub.run(tx));
+        Ok(EventStream { rx })
+    }
+
+    /// `event_stream` with a callback, called on a task of its own; dropping the subscription
+    /// unsubscribes.
+    pub async fn subscribe_event(
+        &mut self,
+        name: &str,
+        event_type: EventType,
+        mut callback: impl FnMut(Event) + Send + 'static,
+    ) -> DevResult<Subscription> {
+        let mut events = self.event_stream(name, event_type).await?;
+        Ok(Subscription(tokio::spawn(async move {
+            while let Some(e) = events.recv().await {
+                callback(e);
+            }
+        })))
+    }
+
+    /// The synchronous first event: the current value, configuration, pipe or interface.
+    async fn first_event(&mut self, name: &str, event_type: EventType, channel: &str) -> Option<Event> {
+        let data = match event_type {
+            EventType::DataReady => return None,
+            EventType::AttrConf => self.get_attribute_config(&[name]).await.map(|mut c| EventData::Conf(c.remove(0))),
+            EventType::Pipe => self.read_pipe(name).await.map(EventData::Pipe),
+            EventType::InterfaceChange => match (self.command_list_query().await, self.get_attribute_config(&[]).await)
+            {
+                (Ok(commands), Ok(attributes)) => Ok(EventData::Interface { commands, attributes, started: false }),
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            },
+            _ => self.read_attribute(name).await.map(EventData::Attr),
+        };
+        Some(Event { channel: channel.into(), seq: 0, event_type, time: now(), data })
     }
 
     pub fn set_source(&mut self, source: Source) {
@@ -119,7 +304,8 @@ impl DeviceProxy {
             Err(e) if e.reason() == "API_CommunicationFailed" && self.resolved.is_some() => {
                 let (host, device) = self.resolved.clone().expect("checked");
                 let (_, endpoint) = Box::pin(import(&host, &device)).await?; // boxed: import calls back into here
-                self.link = Link::connect(&endpoint, &device).await?;
+                self.endpoint = crate::transport::resolve(&endpoint).await?;
+                self.link = Link::connect(&self.endpoint, &device).await?;
                 self.send(op).await
             }
             result => result,

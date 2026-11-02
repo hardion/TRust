@@ -2,6 +2,7 @@
 
 use crate::db::{Database, hostname, tango_host};
 use crate::dbfile::DbFile;
+use crate::events::{self, EventData, EventSink, EventType, Hub};
 use crate::props::{PropInfo, Properties};
 use crate::protocol::*;
 use crate::store::{Raw, Store, apply_attribute};
@@ -11,7 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 const BLACK_BOX_DEPTH: usize = 50;
 const POLL_RING_DEPTH: usize = 10;
@@ -39,6 +40,8 @@ pub trait Device: Send + 'static {
     fn properties(&self) -> Vec<PropInfo> {
         vec![]
     }
+    /// Receives the sink through which the device pushes its own events, before the first `init`.
+    fn attach(&mut self, _events: EventSink) {}
     /// (Re-)initialises the device with its property values: at export and on the Init command.
     fn init(&mut self, _props: &Properties) -> DevResult<()> {
         Ok(())
@@ -122,6 +125,9 @@ struct Entry {
     store: Store,
     /// Why the device is FAULT after its initialisation, if it is.
     fault: Option<String>,
+    hub: Arc<Hub>,
+    /// Per polled event channel: the value of the last event sent and when.
+    last_events: HashMap<String, (Option<DevResult<AttrValue>>, f64)>,
     cmds: Vec<CmdInfo>,
     attrs: Vec<AttrInfo>,
     pipes: Vec<PipeInfo>,
@@ -142,6 +148,8 @@ impl Entry {
             class: dev.class_name(),
             store: Store::None,
             fault: None,
+            hub: Arc::new(Hub::new(events::HEARTBEAT, events::CONFIRM)),
+            last_events: HashMap::new(),
             cmds: cmds.into_iter().chain(dev.commands()).collect(),
             attrs: attrs.into_iter().chain(dev.attributes()).collect(),
             pipes: dev.pipes(),
@@ -172,6 +180,10 @@ impl Entry {
     fn reinit(&mut self) -> DevResult<()> {
         let raw = self.store.properties_blocking(&self.name, &self.class, &self.property_names())?;
         self.init(raw);
+        let interface =
+            EventData::Interface { commands: self.cmds.clone(), attributes: self.attrs.clone(), started: true };
+        let channel = events::channel(&self.name, "", EventType::InterfaceChange);
+        self.hub.publish(&channel, EventType::InterfaceChange, Ok(interface));
         Ok(())
     }
 
@@ -294,10 +306,13 @@ impl Entry {
             max_dim_x: a.max_dim_x,
             max_dim_y: a.max_dim_y,
             disp_level: a.disp_level,
+            events_by_code: a.events_by_code,
             ..c
         };
         self.store.save_attribute(&self.name, a);
-        Ok(a.clone())
+        let (a, channel) = (a.clone(), events::channel(&self.name, &a.name, EventType::AttrConf));
+        self.hub.publish(&channel, EventType::AttrConf, Ok(EventData::Conf(a.clone())));
+        Ok(a)
     }
 
     fn read_pipe(&mut self, name: &str) -> DevResult<PipeValue> {
@@ -318,11 +333,72 @@ impl Entry {
         let time = now();
         if self.attr_ring.contains_key(obj) {
             let value = self.read_attr(obj);
+            self.fire_polled(obj, &value);
             push(self.attr_ring.get_mut(obj).unwrap(), History { time, value }, POLL_RING_DEPTH);
         } else {
             let value = self.execute(obj, Value::Void);
             push(self.cmd_ring.get_mut(obj).unwrap(), History { time, value }, POLL_RING_DEPTH);
         }
+    }
+
+    /// CHANGE, PERIODIC and ARCHIVE events of a polled attribute (SPEC §9.1).
+    fn fire_polled(&mut self, attr: &str, value: &DevResult<AttrValue>) {
+        let Ok(i) = find(&self.attrs, attr, "") else { return };
+        let a = &self.attrs[i];
+        for t in [EventType::Change, EventType::Periodic, EventType::Archive] {
+            let channel = events::channel(&self.name, &a.name, t);
+            if !self.hub.active(&channel) {
+                continue;
+            }
+            let (last, at) = self.last_events.get(&channel).cloned().unwrap_or((None, 0.0));
+            let elapsed_ms = (now() - at) * 1000.0;
+            let fire = match (t, &last) {
+                (_, None) => true,
+                (EventType::Change, Some(old)) => events::changed(old, value, a.abs_change, a.rel_change),
+                (EventType::Periodic, _) => elapsed_ms >= a.period.unwrap_or(1000) as f64,
+                (_, Some(old)) => {
+                    events::changed(old, value, a.archive_abs_change, a.archive_rel_change)
+                        || a.archive_period.is_some_and(|p| elapsed_ms >= p as f64)
+                }
+            };
+            if fire {
+                self.hub.publish(&channel, t, value.clone().map(EventData::Attr));
+                self.last_events.insert(channel, (Some(value.clone()), now()));
+            }
+        }
+    }
+
+    /// Validates a subscription to `name` (SPEC §9.1) and returns its channel.
+    fn event_channel(&self, name: &str, t: EventType) -> DevResult<String> {
+        let fail = |reason: &str, desc: String| Err(DevFailed::new(reason, desc, "EventSubscriptionChange"));
+        let name = match t {
+            EventType::InterfaceChange => String::new(),
+            EventType::Pipe => self.pipes[find(&self.pipes, name, "API_PipeNotFound")?].name.clone(),
+            _ => {
+                let a = &self.attrs[find(&self.attrs, name, "API_AttrNotFound")?];
+                let polled = self.attr_ring.contains_key(&a.name) || a.events_by_code;
+                let thresholds = match t {
+                    EventType::Change => a.abs_change.or(a.rel_change).is_some(),
+                    EventType::Archive => {
+                        a.archive_abs_change.or(a.archive_rel_change).is_some() || a.archive_period.is_some()
+                    }
+                    _ => true,
+                };
+                if matches!(t, EventType::Change | EventType::Periodic | EventType::Archive) {
+                    if !polled {
+                        return fail("API_AttributePollingNotStarted", format!("{} is not polled", a.name));
+                    }
+                    if !thresholds && !a.events_by_code {
+                        return fail(
+                            "API_EventPropertiesNotSet",
+                            format!("{} has no {} threshold", a.name, t.suffix()),
+                        );
+                    }
+                }
+                a.name.clone()
+            }
+        };
+        Ok(events::channel(&self.name, &name, t))
     }
 
     fn handle(&mut self, op: Op, source: Source, ctx: &Ctx) -> DevResult<Data> {
@@ -411,6 +487,9 @@ impl Device for Admin {
             cmd("QueryClass", DataType::StringArray),
             cmd("QueryDevice", DataType::StringArray),
             cmd("Kill", DataType::Void),
+            CmdInfo { in_type: DataType::StringArray, ..cmd("EventSubscriptionChange", DataType::LongStringArray) },
+            CmdInfo { in_type: DataType::StringArray, ..cmd("ZmqEventSubscriptionChange", DataType::LongStringArray) },
+            CmdInfo { in_type: DataType::StringArray, ..cmd("EventConfirmSubscription", DataType::Void) },
         ]
     }
     fn execute(&mut self, cmd: &str, _arg: Value) -> DevResult<Value> {
@@ -436,6 +515,8 @@ struct Ctx {
     adm_name: String,
     server_id: String,
     host: String,
+    hub: Arc<Hub>,
+    stop: watch::Sender<bool>,
 }
 
 impl Ctx {
@@ -443,6 +524,12 @@ impl Ctx {
         if req.v != PROTOCOL_VERSION {
             let desc = format!("protocol version {} not supported, expected {PROTOCOL_VERSION}", req.v);
             return Err(DevFailed::new("API_UnsupportedProtocol", desc, "Server"));
+        }
+        if let Op::CommandExecution { name, arg } = &req.op
+            && req.device.eq_ignore_ascii_case(&self.adm_name)
+            && name.contains("Subscription")
+        {
+            return self.event_command(name, arg).map(Data::Value);
         }
         let entry = self.devices.get(&req.device.to_lowercase());
         let entry =
@@ -458,6 +545,48 @@ impl Ctx {
         };
         push(&mut e.black_box, record, BLACK_BOX_DEPTH);
         e.handle(req.op, req.source, self)
+    }
+}
+
+impl Ctx {
+    /// The admin event commands (SPEC §9.2), handled here as they reach into other devices.
+    fn event_command(&self, name: &str, arg: &Value) -> DevResult<Value> {
+        let Value::StringArray(a) = arg else {
+            return Err(DevFailed::new(
+                "API_IncompatibleCmdArgumentType",
+                format!("{name} expects a StringArray"),
+                name,
+            ));
+        };
+        let field = |i: usize| a.get(i).map(String::as_str).unwrap_or_default();
+        let confirm = name == "EventConfirmSubscription";
+        let t = EventType::parse(field(if confirm { 2 } else { 3 }))
+            .ok_or_else(|| DevFailed::new("API_InvalidArgs", format!("unknown event type in {a:?}"), name))?;
+        let entry = self.devices.get(&field(0).to_lowercase());
+        let entry =
+            entry.ok_or_else(|| DevFailed::new("API_DeviceNotFound", format!("{} not found", field(0)), name))?;
+        let mut e = lock(entry);
+        let channel = e.event_channel(field(1), t)?;
+        if confirm {
+            // the immediate heartbeat tells the client its event link is live
+            self.hub.confirm(&channel);
+            self.hub.beat(&events::heartbeat_channel(&self.adm_name));
+            return Ok(Value::Void);
+        }
+        if field(2) == "unsubscribe" {
+            self.hub.unsubscribe(&channel);
+        } else {
+            self.hub.subscribe(&channel);
+            // the change rules start from the current polled value, which the client reads itself
+            let polled = find(&e.attrs, field(1), "").ok().and_then(|i| e.attr_ring.get(&e.attrs[i].name));
+            if let Some(last) = polled.and_then(VecDeque::front).map(|h| h.value.clone()) {
+                e.last_events.insert(channel.clone(), (Some(last), now()));
+            }
+        }
+        let ms = |d: Duration| d.as_millis() as i32;
+        let zmq = self.hub.zmq_endpoint.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let info = vec![zmq, channel, events::heartbeat_channel(&self.adm_name)];
+        Ok(Value::LongStringArray(vec![1, ms(self.hub.heartbeat), ms(self.hub.confirm)], info))
     }
 }
 
@@ -478,6 +607,22 @@ impl Handler {
     /// Typed entry point, for transports that carry the envelope themselves.
     pub fn call(&self, req: Request, peer: &str) -> Reply {
         Reply { id: req.id, reply: self.0.handle(req, peer) }
+    }
+
+    /// The events every transport forwards to its subscribers.
+    pub(crate) fn events(&self) -> tokio::sync::broadcast::Receiver<Arc<events::Event>> {
+        self.0.hub.receiver()
+    }
+
+    #[cfg(feature = "zmq")]
+    pub(crate) fn hub(&self) -> &Hub {
+        &self.0.hub
+    }
+
+    /// Resolves once the server shuts down (Kill, signal).
+    pub(crate) async fn stopped(&self) {
+        let mut stop = self.0.stop.subscribe();
+        let _ = stop.wait_for(|s| *s).await;
     }
 
     /// Names (lower case) of the exported devices, the admin device included.
@@ -505,6 +650,8 @@ pub struct Server {
     polling: Vec<(String, String, bool, Duration)>,
     config: Config,
     endpoints: Vec<String>,
+    heartbeat: Duration,
+    confirm: Duration,
 }
 
 /// What `start` hands back to `run`: the handler and what the export needs.
@@ -525,7 +672,22 @@ impl Server {
             polling: vec![],
             config: Config::Auto,
             endpoints: vec![],
+            heartbeat: events::HEARTBEAT,
+            confirm: events::CONFIRM,
         }
+    }
+
+    /// The event heartbeat period (default 9 s, RFC-12).
+    pub fn heartbeat(mut self, period: Duration) -> Self {
+        self.heartbeat = period;
+        self
+    }
+
+    /// The period clients confirm their event subscriptions at (default 200 s); a subscription not
+    /// confirmed for 3 periods is dropped.
+    pub fn event_confirm(mut self, period: Duration) -> Self {
+        self.confirm = period;
+        self
     }
 
     /// From command-line arguments, Tango style: `<instance> [-nodb] [-file=<path>]
@@ -644,6 +806,7 @@ impl Server {
             }
             _ = terminated() => Ok(()),
         };
+        let _ = started.handler.0.stop.send(true);
         if let Store::Db(db, _) = &started.store {
             db.unexport_server(&server_name).await?;
         }
@@ -698,11 +861,15 @@ impl Server {
         let names = devices.iter().map(|(n, d)| format!("{}::{n}", d.class_name())).collect();
         let admin: Box<dyn Device> = Box::new(Admin { classes, devices: names, shutdown: shutdown.clone() });
 
+        let hub = Arc::new(Hub::new(self.heartbeat, self.confirm));
+        let (stop, _) = watch::channel(false);
         let mut entries = HashMap::new();
         let mut exported = vec![];
         for (name, dev) in devices.into_iter().chain([(adm_name.clone(), admin)]) {
             let mut entry = Entry::new(&name, dev);
             entry.store = store.clone();
+            entry.hub = hub.clone();
+            entry.dev.attach(EventSink { device: name.clone(), hub: hub.clone() });
             let attrs: Vec<String> = entry.attrs.iter().map(|a| a.name.clone()).collect();
             let stored = store.attribute_properties(&name, &attrs).await?;
             for a in &mut entry.attrs {
@@ -731,16 +898,29 @@ impl Server {
                     name
                 }
             };
+            let mut stopped = stop.subscribe();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(period);
                 loop {
-                    tick.tick().await;
-                    lock(&entry).poll(&obj);
+                    tokio::select! {
+                        _ = tick.tick() => lock(&entry).poll(&obj),
+                        _ = stopped.wait_for(|s| *s) => break,
+                    }
                 }
             });
         }
+        let (beating, channel, mut stopped) = (hub.clone(), events::heartbeat_channel(&adm_name), stop.subscribe());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(beating.heartbeat);
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => beating.beat(&channel),
+                    _ = stopped.wait_for(|s| *s) => break,
+                }
+            }
+        });
 
-        let ctx = Ctx { devices: entries, adm_name, server_id: server, host: endpoint_host(endpoint) };
+        let ctx = Ctx { devices: entries, adm_name, server_id: server, host: endpoint_host(endpoint), hub, stop };
         Ok(Started { handler: Handler(Arc::new(ctx)), store, devices: exported, shutdown })
     }
 }

@@ -30,7 +30,7 @@ of `docs/PLAN.md` §Phase 2), ⛔ out of scope (with reason).
 |---|---|
 | Static metadata: type, format, writable, dims, display level | ✅ |
 | Properties: label, unit, format, min/max value, alarms, warnings | ✅ |
-| Event properties: abs/rel change, period, archive * | 🔨 M2 |
+| Event properties: abs/rel change, period, archive * | ✅ (stored in the Database) |
 | Quality VALID/ALARM/WARNING | ✅ · CHANGING/INVALID set by device code 🔨 M3 |
 | `READ_WITH_WRITE` + writable attribute name | 🔨 M3 |
 | Memorized attributes (`__value`) | 🔨 M3 (with the Database) |
@@ -64,7 +64,7 @@ of `docs/PLAN.md` §Phase 2), ⛔ out of scope (with reason).
 |---|---|
 | Metadata, read/write, blob key → value | ✅ |
 | Nested blobs | 🔨 M3 |
-| Pipe events | 🔨 M2 |
+| Pipe events | ✅ |
 | Pipes not polled | ✅ |
 
 ## RFC-8 Server
@@ -75,7 +75,7 @@ of `docs/PLAN.md` §Phase 2), ⛔ out of scope (with reason).
 | Admin device name `dserver/<server>/<instance>` | ✅ |
 | Black box | ✅ |
 | Per-device serialisation | ✅ |
-| Admin command table (polling, events, restart, kill, locking, logging) | ✅ QueryClass, QueryDevice, Kill · 🔨 M2 events · 🔨 M3 the rest |
+| Admin command table (polling, events, restart, kill, locking, logging) | ✅ QueryClass, QueryDevice, Kill, EventSubscriptionChange, ZmqEventSubscriptionChange, EventConfirmSubscription · 🔨 M3 the rest |
 | Export / unexport sequences with the Database | ✅ |
 
 ## RFC-9 Data types
@@ -99,11 +99,11 @@ of `docs/PLAN.md` §Phase 2), ⛔ out of scope (with reason).
 
 | Requirement | Status |
 |---|---|
-| Event types INTERFACE_CHANGE, PIPE, ATTR_CONF, CHANGE, PERIODIC, ARCHIVE, USER (+ DATA_READY) | 🔨 M2 |
-| Negotiation through admin commands, SUBSCRIPTION_INFO | 🔨 M2 |
-| Heartbeat every 9 s, confirmation within 600 s | 🔨 M2 |
-| Re-subscription, missed-event and overflow notification | 🔨 M2 |
-| Channels per transport (RFC-13 ZeroMQ and the others) | 🔨 M2 |
+| Event types INTERFACE_CHANGE, PIPE, ATTR_CONF, CHANGE, PERIODIC, ARCHIVE, USER (+ DATA_READY) | ✅ (INTERFACE_CHANGE on Init; dynamic attributes 🔨 M3) |
+| Negotiation through admin commands, SUBSCRIPTION_INFO | ✅ |
+| Heartbeat every 9 s, confirmation within 600 s | ✅ (both configurable) |
+| Re-subscription, missed-event and overflow notification | ✅ |
+| Channels per transport (RFC-13 ZeroMQ and the others) | ✅ TCP, ZeroMQ PUB/SUB, gRPC streaming, Zenoh pub/sub |
 
 ## RFC-14 Logging
 

@@ -5,10 +5,11 @@
 //! matches them with the request `id`.
 
 use crate::client::bad_reply;
+use crate::events::Event;
 use crate::server::Handler;
 use crate::types::{DevFailed, DevResult};
 use tokio::sync::mpsc;
-use zeromq::{ReqSocket, RouterSocket, Socket, SocketRecv, SocketSend, ZmqError, ZmqMessage};
+use zeromq::{PubSocket, ReqSocket, RouterSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqError, ZmqMessage};
 
 impl From<ZmqError> for DevFailed {
     fn from(e: ZmqError) -> Self {
@@ -20,6 +21,7 @@ impl From<ZmqError> for DevFailed {
 pub(crate) async fn serve(endpoint: &str, handler: Handler) -> DevResult<()> {
     let mut socket = RouterSocket::new();
     socket.bind(endpoint).await?;
+    publish(endpoint, handler.clone()).await?;
     let (mut send, mut recv) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ZmqMessage>();
     tokio::spawn(async move {
@@ -39,6 +41,51 @@ pub(crate) async fn serve(endpoint: &str, handler: Handler) -> DevResult<()> {
             frames.push_back(handler.frame(&payload, &format!("zmq:{peer}")).into());
             let _ = tx.send(ZmqMessage::try_from(frames).expect("non-empty envelope"));
         });
+    }
+}
+
+/// Binds the PUB socket next to the ROUTER (port chosen by the system), advertises it in
+/// SUBSCRIPTION_INFO and publishes every event as `[channel, json]`.
+async fn publish(endpoint: &str, handler: Handler) -> DevResult<()> {
+    let at = match endpoint.strip_prefix("tcp://").and_then(|a| a.rsplit_once(':')) {
+        Some((host, _)) => format!("tcp://{host}:0"),
+        None => format!("{endpoint}.pub"), // ipc
+    };
+    let mut socket = PubSocket::new();
+    let bound = socket.bind(&at).await?.to_string().replace("0.0.0.0", &crate::db::hostname());
+    *handler.hub().zmq_endpoint.lock().unwrap_or_else(|p| p.into_inner()) = bound;
+    let mut events = crate::transport::events(handler, |_| true);
+    tokio::spawn(async move {
+        while let Some(e) = events.recv().await {
+            let mut message = ZmqMessage::from(e.channel.clone());
+            message.push_back(serde_json::to_vec(&*e).expect("an event is always serialisable").into());
+            if socket.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+    Ok(())
+}
+
+/// The events of `channels` on a SUB socket connected to the server's PUB socket.
+pub(crate) struct EventLink(SubSocket);
+
+impl EventLink {
+    pub(crate) async fn connect(endpoint: &str, channels: &[String]) -> DevResult<Self> {
+        if endpoint.is_empty() {
+            return Err(DevFailed::new("API_EventNotSupported", "the server publishes no ZeroMQ events", "zmq"));
+        }
+        let mut socket = SubSocket::new();
+        socket.connect(endpoint).await?;
+        for c in channels {
+            socket.subscribe(c).await?;
+        }
+        Ok(Self(socket))
+    }
+
+    pub(crate) async fn next(&mut self) -> DevResult<Event> {
+        let frames = self.0.recv().await?.into_vec();
+        Ok(serde_json::from_slice(frames.last().ok_or_else(|| bad_reply("empty message"))?)?)
     }
 }
 

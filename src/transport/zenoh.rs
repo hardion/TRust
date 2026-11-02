@@ -3,6 +3,7 @@
 //! Zenoh routes a query to the device wherever it runs: the key expression replaces the address.
 
 use crate::client::bad_reply;
+use crate::events::Event;
 use crate::server::Handler;
 use crate::types::{DevFailed, DevResult};
 use std::time::Duration;
@@ -14,23 +15,29 @@ fn failed(e: impl std::fmt::Display) -> DevFailed {
     DevFailed::new("API_CommunicationFailed", e.to_string(), "zenoh")
 }
 
-/// A session that is closed on a plain thread: dropping a Zenoh session blocks, which panics when
-/// it happens inside tokio (a task cancelled at runtime shutdown, a current-thread runtime).
-pub(crate) struct Detached(Option<Session>);
+/// A Zenoh object (session, subscriber) dropped on a plain thread: dropping one blocks, which
+/// panics when it happens inside tokio (a task cancelled at runtime shutdown, a current-thread
+/// runtime).
+pub(crate) struct Detached<T: Send + 'static = Session>(Option<T>);
 
-impl std::ops::Deref for Detached {
-    type Target = Session;
-    fn deref(&self) -> &Session {
+impl<T: Send + 'static> std::ops::Deref for Detached<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
         self.0.as_ref().expect("taken only on drop")
     }
 }
 
-impl Drop for Detached {
+impl<T: Send + 'static> Drop for Detached<T> {
     fn drop(&mut self) {
-        if let Some(session) = self.0.take() {
-            std::thread::spawn(move || drop(session));
+        if let Some(inner) = self.0.take() {
+            std::thread::spawn(move || drop(inner));
         }
     }
+}
+
+/// Zenoh key of an event channel.
+fn event_key(channel: &str) -> String {
+    format!("tango/event/{channel}")
 }
 
 pub(crate) fn key(device: &str) -> String {
@@ -57,6 +64,16 @@ pub(crate) async fn open(config: Config) -> DevResult<Detached> {
 }
 
 pub(crate) async fn serve(session: Detached, handler: Handler) -> DevResult<()> {
+    let session = std::sync::Arc::new(session);
+    let (publisher, mut events) = (session.clone(), crate::transport::events(handler.clone(), |_| true));
+    tokio::spawn(async move {
+        while let Some(e) = events.recv().await {
+            let json = serde_json::to_vec(&*e).expect("an event is always serialisable");
+            if publisher.put(event_key(&e.channel), json).await.is_err() {
+                break;
+            }
+        }
+    });
     let mut tasks = tokio::task::JoinSet::new();
     for device in handler.devices() {
         let queryable = session.declare_queryable(key(&device)).await.map_err(failed)?;
@@ -76,6 +93,33 @@ pub(crate) async fn serve(session: Detached, handler: Handler) -> DevResult<()> 
     }
     tasks.join_all().await;
     Ok(())
+}
+
+type Subscriber = zenoh::pubsub::Subscriber<zenoh::handlers::FifoChannelHandler<zenoh::sample::Sample>>;
+
+/// The events of some channels: one subscriber on `tango/event/**`, filtered here.
+pub(crate) struct EventLink {
+    subscriber: Detached<Subscriber>,
+    channels: Vec<String>,
+    _session: Detached,
+}
+
+impl EventLink {
+    pub(crate) async fn connect(locator: &str, channels: Vec<String>) -> DevResult<Self> {
+        let session = open(config(locator, false)?).await?;
+        let subscriber = session.declare_subscriber(event_key("**")).await.map_err(failed)?;
+        Ok(Self { subscriber: Detached(Some(subscriber)), channels, _session: session })
+    }
+
+    pub(crate) async fn next(&mut self) -> DevResult<Event> {
+        loop {
+            let sample = self.subscriber.recv_async().await.map_err(failed)?;
+            let event: Event = serde_json::from_slice(&sample.payload().to_bytes())?;
+            if self.channels.contains(&event.channel) {
+                return Ok(event);
+            }
+        }
+    }
 }
 
 pub(crate) struct Link {
