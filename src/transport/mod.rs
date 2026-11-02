@@ -27,7 +27,7 @@ pub(crate) mod zmq;
 /// The transports, named by the scheme of an endpoint URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
-    /// `tcp://host:port` (also `tango://` or no scheme): JSON Lines.
+    /// `tcp://host:port` (or no scheme): JSON Lines.
     Tcp,
     /// `zmq+tcp://host:port`, `zmq+ipc://path`: ZeroMQ.
     Zmq,
@@ -44,7 +44,7 @@ impl Scheme {
     pub fn parse(endpoint: &str) -> DevResult<(Self, String)> {
         let (scheme, rest) = endpoint.split_once("://").unwrap_or(("tcp", endpoint));
         let parsed = match scheme {
-            "tcp" | "tango" => (Self::Tcp, rest.into()),
+            "tcp" => (Self::Tcp, rest.into()),
             "zmq+tcp" | "zmq+ipc" => (Self::Zmq, format!("{}://{rest}", &scheme[4..])),
             "grpc" => (Self::Grpc, rest.into()),
             "zenoh" => (Self::Zenoh, rest.into()),
@@ -85,20 +85,49 @@ impl Scheme {
     }
 }
 
-/// Serves `handler` on one endpoint URL forever.
-pub(crate) async fn serve(endpoint: &str, handler: Handler) -> DevResult<()> {
+/// An endpoint bound but not served yet.
+pub(crate) enum Listener {
+    /// TCP based wires bind first so that port 0 resolves to the real port before export.
+    #[allow(dead_code)] // without tcp, grpc and detect
+    Tcp(Scheme, tokio::net::TcpListener),
+    /// ZeroMQ and Zenoh bind when served.
+    #[allow(dead_code)] // without zmq and zenoh
+    Later(Scheme, String),
+}
+
+/// Binds an endpoint URL; returns the URL with the real port and the listener.
+pub(crate) async fn listen(endpoint: &str) -> DevResult<(String, Listener)> {
     let (scheme, native) = Scheme::parse(endpoint)?;
-    match scheme {
+    Ok(match scheme {
+        Scheme::Tcp | Scheme::Grpc | Scheme::Auto => {
+            let listener = tokio::net::TcpListener::bind(&native).await?;
+            let prefix = match scheme {
+                Scheme::Tcp => "tcp",
+                Scheme::Grpc => "grpc",
+                _ => "auto",
+            };
+            (format!("{prefix}://{}", listener.local_addr()?), Listener::Tcp(scheme, listener))
+        }
+        Scheme::Zmq | Scheme::Zenoh => (endpoint.to_string(), Listener::Later(scheme, native)),
+    })
+}
+
+/// Serves `handler` on a bound endpoint forever.
+#[allow(unused_variables)]
+pub(crate) async fn serve(listener: Listener, handler: Handler) -> DevResult<()> {
+    match listener {
         #[cfg(feature = "tcp")]
-        Scheme::Tcp => tcp::serve(tokio::net::TcpListener::bind(native).await?, handler).await,
-        #[cfg(feature = "zmq")]
-        Scheme::Zmq => zmq::serve(&native, handler).await,
+        Listener::Tcp(Scheme::Tcp, l) => tcp::serve(l, handler).await,
         #[cfg(feature = "grpc")]
-        Scheme::Grpc => grpc::serve(tokio::net::TcpListener::bind(native).await?, handler).await,
-        #[cfg(feature = "zenoh")]
-        Scheme::Zenoh => zenoh::serve(zenoh::open(zenoh::config(&native, true)?).await?, handler).await,
+        Listener::Tcp(Scheme::Grpc, l) => grpc::serve(l, handler).await,
         #[cfg(feature = "detect")]
-        Scheme::Auto => detect::serve(tokio::net::TcpListener::bind(native).await?, handler).await,
+        Listener::Tcp(Scheme::Auto, l) => detect::serve(l, handler).await,
+        #[cfg(feature = "zmq")]
+        Listener::Later(Scheme::Zmq, native) => zmq::serve(&native, handler).await,
+        #[cfg(feature = "zenoh")]
+        Listener::Later(Scheme::Zenoh, native) => {
+            zenoh::serve(zenoh::open(zenoh::config(&native, true)?).await?, handler).await
+        }
         #[allow(unreachable_patterns)]
         _ => unreachable!("checked by Scheme::parse"),
     }
@@ -169,7 +198,7 @@ mod tests {
         assert_eq!(p("ftp://h:1"), Err("API_UnsupportedTransport".into()));
         if cfg!(feature = "tcp") {
             assert_eq!(p("127.0.0.1:1"), Ok((Scheme::Tcp, "127.0.0.1:1".into())));
-            assert_eq!(p("tango://h:1"), Ok((Scheme::Tcp, "h:1".into())));
+            assert_eq!(p("tango://h:1"), Err("API_UnsupportedTransport".into()), "resolved by the client");
             assert_eq!(p("tcp://h:1"), Ok((Scheme::Tcp, "h:1".into())));
         } else {
             assert_eq!(p("tcp://h:1"), Err("API_UnsupportedTransport".into()));

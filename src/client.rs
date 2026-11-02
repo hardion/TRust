@@ -1,5 +1,6 @@
 //! Client side: `DeviceProxy`, one connection to one device.
 
+use crate::db::{Database, database_endpoint, tango_host};
 use crate::protocol::*;
 use crate::transport::Link;
 use crate::types::*;
@@ -10,6 +11,8 @@ pub struct DeviceProxy {
     source: Source,
     next_id: u64,
     link: Link,
+    /// `(TANGO_HOST, device)` when the device was resolved through a Database.
+    resolved: Option<(String, String)>,
 }
 
 pub(crate) fn bad_reply(what: impl std::fmt::Debug) -> DevFailed {
@@ -22,6 +25,20 @@ fn strings(names: &[&str]) -> Vec<String> {
 
 fn pairs(values: &[(&str, Value)]) -> Vec<(String, Value)> {
     values.iter().map(|(n, v)| (n.to_string(), v.clone())).collect()
+}
+
+fn invalid(url: &str) -> DevFailed {
+    DevFailed::new("API_InvalidArgs", format!("expected tango://host:port/domain/family/member, got {url}"), "url")
+}
+
+/// `(device, endpoint)` of a device or alias, through the Database at `host`.
+async fn import(host: &str, name: &str) -> DevResult<(String, String)> {
+    let db = Database::connect(host).await?;
+    let device = if name.contains('/') { name.to_string() } else { db.alias_device(name).await? };
+    match db.import(&device).await? {
+        (true, endpoint) => Ok((device, endpoint)),
+        (false, _) => Err(DevFailed::new("API_DeviceNotExported", format!("{device} is not exported"), host)),
+    }
 }
 
 /// Splits `<endpoint>/domain/family/member`: the device name is always the last three segments.
@@ -54,20 +71,62 @@ macro_rules! call {
 }
 
 impl DeviceProxy {
-    /// `url` is `<endpoint>/domain/family/member`, the endpoint scheme choosing the transport:
-    /// `tcp://host:port`, `zmq+tcp://host:port`, `grpc://host:port`, `zenoh://tcp/host:7447`,
-    /// `zenoh://` (discovery), `auto://host:port` (probe), see `Scheme`.
+    /// Connects to a device (SPEC §7.1):
+    /// * `tango://dbhost:port/domain/family/member` (or an alias) resolves through that Database,
+    /// * `tango://host:port/domain/family/member#dbase=no` connects directly,
+    /// * `domain/family/member` (or an alias) resolves through the Database at `$TANGO_HOST`,
+    /// * `<endpoint>/domain/family/member` connects directly with the endpoint's transport:
+    ///   `tcp://host:port`, `zmq+tcp://host:port`, `grpc://host:port`, `zenoh://tcp/host:7447`,
+    ///   `zenoh://` (discovery), `auto://host:port` (probe), or `host:port` (TCP), see `Scheme`.
     pub async fn connect(url: &str) -> DevResult<Self> {
+        if let Some(rest) = url.strip_prefix("tango://") {
+            if let Some(rest) = rest.strip_suffix("#dbase=no") {
+                let (host, device) = rest.split_once('/').ok_or_else(|| invalid(url))?;
+                return Self::direct(&database_endpoint(host), device).await;
+            }
+            let (host, name) = rest.split_once('/').ok_or_else(|| invalid(url))?;
+            return Self::resolve(host, name).await;
+        }
+        if !url.contains("://") && url.matches('/').count() <= 2 {
+            let host =
+                tango_host().ok_or_else(|| DevFailed::new("API_TangoHostNotSet", "TANGO_HOST is not set", url))?;
+            return Self::resolve(&host, url).await;
+        }
         let (endpoint, device) = split_url(url)?;
+        Self::direct(endpoint, device).await
+    }
+
+    /// Connects to `device` at `endpoint`, without a Database.
+    pub(crate) async fn direct(endpoint: &str, device: &str) -> DevResult<Self> {
         let link = Link::connect(endpoint, device).await?;
-        Ok(Self { device: device.into(), source: Source::Dev, next_id: 0, link })
+        Ok(Self { device: device.into(), source: Source::Dev, next_id: 0, link, resolved: None })
+    }
+
+    async fn resolve(host: &str, name: &str) -> DevResult<Self> {
+        let (device, endpoint) = import(host, name).await?;
+        let mut proxy = Self::direct(&endpoint, &device).await?;
+        proxy.resolved = Some((host.into(), device));
+        Ok(proxy)
     }
 
     pub fn set_source(&mut self, source: Source) {
         self.source = source;
     }
 
+    /// Sends `op`; a device resolved through a Database is re-imported once if its server is gone.
     async fn call(&mut self, op: Op) -> DevResult<Data> {
+        match self.send(op.clone()).await {
+            Err(e) if e.reason() == "API_CommunicationFailed" && self.resolved.is_some() => {
+                let (host, device) = self.resolved.clone().expect("checked");
+                let (_, endpoint) = Box::pin(import(&host, &device)).await?; // boxed: import calls back into here
+                self.link = Link::connect(&endpoint, &device).await?;
+                self.send(op).await
+            }
+            result => result,
+        }
+    }
+
+    async fn send(&mut self, op: Op) -> DevResult<Data> {
         self.next_id += 1;
         let (id, client, source, device) = (self.next_id, std::process::id() as u64, self.source, self.device.clone());
         let reply = self.link.call(Request { v: PROTOCOL_VERSION, id, client, source, device, op }).await?;

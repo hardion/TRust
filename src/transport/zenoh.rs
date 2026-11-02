@@ -14,6 +14,25 @@ fn failed(e: impl std::fmt::Display) -> DevFailed {
     DevFailed::new("API_CommunicationFailed", e.to_string(), "zenoh")
 }
 
+/// A session that is closed on a plain thread: dropping a Zenoh session blocks, which panics when
+/// it happens inside tokio (a task cancelled at runtime shutdown, a current-thread runtime).
+pub(crate) struct Detached(Option<Session>);
+
+impl std::ops::Deref for Detached {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        self.0.as_ref().expect("taken only on drop")
+    }
+}
+
+impl Drop for Detached {
+    fn drop(&mut self) {
+        if let Some(session) = self.0.take() {
+            std::thread::spawn(move || drop(session));
+        }
+    }
+}
+
 pub(crate) fn key(device: &str) -> String {
     format!("tango/{}", device.to_lowercase())
 }
@@ -33,11 +52,11 @@ pub(crate) fn config(locator: &str, server: bool) -> DevResult<Config> {
     Ok(config)
 }
 
-pub(crate) async fn open(config: Config) -> DevResult<Session> {
-    zenoh::open(config).await.map_err(failed)
+pub(crate) async fn open(config: Config) -> DevResult<Detached> {
+    Ok(Detached(Some(zenoh::open(config).await.map_err(failed)?)))
 }
 
-pub(crate) async fn serve(session: Session, handler: Handler) -> DevResult<()> {
+pub(crate) async fn serve(session: Detached, handler: Handler) -> DevResult<()> {
     let mut tasks = tokio::task::JoinSet::new();
     for device in handler.devices() {
         let queryable = session.declare_queryable(key(&device)).await.map_err(failed)?;
@@ -60,7 +79,7 @@ pub(crate) async fn serve(session: Session, handler: Handler) -> DevResult<()> {
 }
 
 pub(crate) struct Link {
-    session: Session,
+    session: Detached,
     key: String,
 }
 

@@ -63,9 +63,9 @@ async fn raw_socket_protocol_errors() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn tango_scheme_prefix() {
+async fn tango_name_without_database() {
     let addr = start().await;
-    let mut dev = DeviceProxy::connect(&format!("tango://{addr}/{DEV}")).await.unwrap();
+    let mut dev = DeviceProxy::connect(&format!("tango://{addr}/{DEV}#dbase=no")).await.unwrap();
     assert_eq!(dev.name().await.unwrap(), DEV);
 }
 

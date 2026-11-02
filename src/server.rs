@@ -1,11 +1,17 @@
 //! Device server: the `Device` trait, the transport-independent request handler, black box and polling.
 
+use crate::db::{Database, hostname, tango_host};
+use crate::dbfile::DbFile;
+use crate::props::{PropInfo, Properties};
 use crate::protocol::*;
+use crate::store::{Raw, Store, apply_attribute};
 use crate::transport::Scheme;
 use crate::types::*;
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 const BLACK_BOX_DEPTH: usize = 50;
 const POLL_RING_DEPTH: usize = 10;
@@ -29,7 +35,12 @@ pub trait Device: Send + 'static {
     fn pipes(&self) -> Vec<PipeInfo> {
         vec![]
     }
-    fn init(&mut self) -> DevResult<()> {
+    /// The device properties of the class (RFC-5), resolved before each `init`.
+    fn properties(&self) -> Vec<PropInfo> {
+        vec![]
+    }
+    /// (Re-)initialises the device with its property values: at export and on the Init command.
+    fn init(&mut self, _props: &Properties) -> DevResult<()> {
         Ok(())
     }
     fn state(&mut self) -> DevState {
@@ -106,7 +117,11 @@ fn history<T: Clone>(ring: &Ring<T>, name: &str, n: usize, reason: &str) -> DevR
 /// A device exported by the server with its runtime data.
 struct Entry {
     name: String,
+    class: String,
     dev: Box<dyn Device>,
+    store: Store,
+    /// Why the device is FAULT after its initialisation, if it is.
+    fault: Option<String>,
     cmds: Vec<CmdInfo>,
     attrs: Vec<AttrInfo>,
     pipes: Vec<PipeInfo>,
@@ -124,6 +139,9 @@ impl Entry {
         let attrs = [attr("State", DataType::State), attr("Status", DataType::String)];
         Self {
             name: name.into(),
+            class: dev.class_name(),
+            store: Store::None,
+            fault: None,
             cmds: cmds.into_iter().chain(dev.commands()).collect(),
             attrs: attrs.into_iter().chain(dev.attributes()).collect(),
             pipes: dev.pipes(),
@@ -135,8 +153,33 @@ impl Entry {
         }
     }
 
+    fn property_names(&self) -> Vec<String> {
+        self.dev.properties().into_iter().map(|p| p.name).collect()
+    }
+
+    /// Initialises the device from raw property values; failures put it in FAULT (RFC-5).
+    fn init(&mut self, raw: Raw) {
+        self.fault = match Properties::resolve(&self.dev.properties(), |n| raw.get(&n.to_lowercase()).cloned()) {
+            Ok((_, missing)) if !missing.is_empty() => {
+                Some(format!("Missing mandatory property: {}", missing.join(", ")))
+            }
+            Ok((props, _)) => self.dev.init(&props).err().map(|e| e.to_string()),
+            Err(e) => Some(e.to_string()),
+        };
+    }
+
+    /// The Init command: re-reads the properties.
+    fn reinit(&mut self) -> DevResult<()> {
+        let raw = self.store.properties_blocking(&self.name, &self.class, &self.property_names())?;
+        self.init(raw);
+        Ok(())
+    }
+
     /// RFC-2: an ON device with an attribute in ALARM or WARNING is in ALARM.
     fn state(&mut self) -> DevState {
+        if self.fault.is_some() {
+            return DevState::Fault;
+        }
         let state = self.dev.state();
         if state != DevState::On {
             return state;
@@ -149,6 +192,9 @@ impl Entry {
     }
 
     fn status(&mut self) -> String {
+        if let Some(why) = &self.fault {
+            return format!("The device is in FAULT state.\n{why}");
+        }
         self.dev.status().unwrap_or_else(|| format!("The device is in {} state.", self.state()))
     }
 
@@ -167,7 +213,7 @@ impl Entry {
 
     fn execute(&mut self, name: &str, arg: Value) -> DevResult<Value> {
         match name {
-            "Init" => self.dev.init().map(|_| Value::Void),
+            "Init" => self.reinit().map(|_| Value::Void),
             "State" => Ok(Value::State(self.state())),
             "Status" => Ok(Value::String(self.status())),
             _ => self.dev.execute(name, arg),
@@ -250,6 +296,7 @@ impl Entry {
             disp_level: a.disp_level,
             ..c
         };
+        self.store.save_attribute(&self.name, a);
         Ok(a.clone())
     }
 
@@ -348,6 +395,7 @@ impl Entry {
 struct Admin {
     classes: Vec<String>,
     devices: Vec<String>,
+    shutdown: Arc<Notify>,
 }
 
 impl Device for Admin {
@@ -358,11 +406,22 @@ impl Device for Admin {
         DevState::On
     }
     fn commands(&self) -> Vec<CmdInfo> {
-        let cmd = |name: &str| CmdInfo { name: name.into(), out_type: DataType::StringArray, ..Default::default() };
-        vec![cmd("QueryClass"), cmd("QueryDevice")]
+        let cmd = |name: &str, out_type| CmdInfo { name: name.into(), out_type, ..Default::default() };
+        vec![
+            cmd("QueryClass", DataType::StringArray),
+            cmd("QueryDevice", DataType::StringArray),
+            cmd("Kill", DataType::Void),
+        ]
     }
     fn execute(&mut self, cmd: &str, _arg: Value) -> DevResult<Value> {
-        Ok(Value::StringArray(if cmd == "QueryClass" { self.classes.clone() } else { self.devices.clone() }))
+        Ok(match cmd {
+            "QueryClass" => Value::StringArray(self.classes.clone()),
+            "QueryDevice" => Value::StringArray(self.devices.clone()),
+            _ => {
+                self.shutdown.notify_one(); // Kill: the reply leaves before the server stops
+                Value::Void
+            }
+        })
     }
 }
 
@@ -427,21 +486,103 @@ impl Handler {
     }
 }
 
+type Factory = Box<dyn Fn() -> Box<dyn Device> + Send + Sync>;
+
+/// Where the devices and their properties come from.
+enum Config {
+    Auto,
+    NoDb,
+    Database(String),
+    File(PathBuf),
+}
+
 /// A device server (RFC-8): hosts devices on one or several endpoints.
 pub struct Server {
     exec: String,
     instance: String,
     devices: Vec<(String, Box<dyn Device>)>,
+    classes: HashMap<String, Factory>,
     polling: Vec<(String, String, bool, Duration)>,
+    config: Config,
+    endpoints: Vec<String>,
+}
+
+/// What `start` hands back to `run`: the handler and what the export needs.
+pub struct Started {
+    pub handler: Handler,
+    store: Store,
+    devices: Vec<String>,
+    shutdown: Arc<Notify>,
 }
 
 impl Server {
     pub fn new(exec: &str, instance: &str) -> Self {
-        Self { exec: exec.into(), instance: instance.into(), devices: vec![], polling: vec![] }
+        Self {
+            exec: exec.into(),
+            instance: instance.into(),
+            devices: vec![],
+            classes: HashMap::new(),
+            polling: vec![],
+            config: Config::Auto,
+            endpoints: vec![],
+        }
     }
 
+    /// From command-line arguments, Tango style: `<instance> [-nodb] [-file=<path>]
+    /// [-dbhost=<host:port>] [-endpoint=<url>]...`. Without option, `$TANGO_HOST` is used if set.
+    pub fn from_args(exec: &str, args: impl IntoIterator<Item = impl Into<String>>) -> DevResult<Self> {
+        let mut server = Self::new(exec, "");
+        for arg in args.into_iter().map(Into::into) {
+            if arg == "-nodb" {
+                server.config = Config::NoDb;
+            } else if let Some(p) = arg.strip_prefix("-file=") {
+                server.config = Config::File(p.into());
+            } else if let Some(h) = arg.strip_prefix("-dbhost=") {
+                server.config = Config::Database(h.into());
+            } else if let Some(e) = arg.strip_prefix("-endpoint=") {
+                server.endpoints.push(e.into());
+            } else if server.instance.is_empty() && !arg.starts_with('-') {
+                server.instance = arg;
+            } else {
+                return Err(DevFailed::new("API_InvalidArgs", format!("unknown argument {arg}"), "Server::from_args"));
+            }
+        }
+        if server.instance.is_empty() {
+            let usage =
+                format!("usage: {exec} <instance> [-nodb] [-file=<path>] [-dbhost=<host:port>] [-endpoint=<url>]");
+            return Err(DevFailed::new("API_InvalidArgs", usage, "Server::from_args"));
+        }
+        Ok(server)
+    }
+
+    /// A device created in code; registered in the Database if there is one.
     pub fn device(mut self, name: &str, device: impl Device) -> Self {
         self.devices.push((name.into(), Box::new(device)));
+        self
+    }
+
+    /// A device class: one device is created for each device of this class registered for the
+    /// server in the Database (or Database file).
+    pub fn class(mut self, name: &str, factory: impl Fn() -> Box<dyn Device> + Send + Sync + 'static) -> Self {
+        self.classes.insert(name.into(), Box::new(factory));
+        self
+    }
+
+    /// Uses the Database at `tango_host` (default: `$TANGO_HOST`).
+    pub fn database(mut self, tango_host: &str) -> Self {
+        self.config = Config::Database(tango_host.into());
+        self
+    }
+
+    /// Ignores `$TANGO_HOST`: devices and properties come from code only.
+    pub fn nodb(mut self) -> Self {
+        self.config = Config::NoDb;
+        self
+    }
+
+    /// Reads devices and properties from a Database file (RFC-6), read-only.
+    pub fn db_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config = Config::File(path.into());
         self
     }
 
@@ -457,24 +598,56 @@ impl Server {
         self
     }
 
-    /// Serves the devices on every endpoint URL at once, forever: `tcp://host:port`,
-    /// `zmq+tcp://host:port`, `grpc://host:port`, `zenoh://<locator>`, `auto://host:port`
-    /// (see `Scheme`). Fails at once if a scheme is not compiled in.
+    /// `run` on the `-endpoint=` arguments, default `auto://0.0.0.0:0` (`tcp://` without `detect`).
+    pub async fn run_args(mut self) -> DevResult<()> {
+        let endpoints = std::mem::take(&mut self.endpoints);
+        match endpoints.is_empty() {
+            true if cfg!(feature = "detect") => self.run(["auto://0.0.0.0:0"]).await,
+            true => self.run(["tcp://0.0.0.0:0"]).await,
+            false => self.run(endpoints).await,
+        }
+    }
+
+    /// Serves the devices on every endpoint URL at once until `Kill`, SIGINT or SIGTERM:
+    /// `tcp://host:port`, `zmq+tcp://host:port`, `grpc://host:port`, `zenoh://<locator>`,
+    /// `auto://host:port` (see `Scheme`); port 0 picks a free port. With a Database, the devices
+    /// are exported with the first endpoint and unexported on the way out.
     pub async fn run(self, endpoints: impl IntoIterator<Item = impl AsRef<str>>) -> DevResult<()> {
         let endpoints: Vec<String> = endpoints.into_iter().map(|e| e.as_ref().to_owned()).collect();
         for e in &endpoints {
             Scheme::parse(e)?;
         }
-        let handler = self.start(&endpoints.join(" "))?;
+        let mut listeners = vec![];
+        for e in &endpoints {
+            listeners.push(crate::transport::listen(e).await?);
+        }
+        let export = listeners.first().map(|(url, _)| url.replace("0.0.0.0", &hostname())).unwrap_or_default();
+        let server_name = format!("{}/{}", self.exec, self.instance);
+        let started = self.start(&export).await?;
+        if let Store::Db(db, _) = &started.store {
+            for dev in &started.devices {
+                db.export(dev, &export, &hostname()).await?;
+            }
+        }
         let mut servers = tokio::task::JoinSet::new();
-        for e in endpoints {
-            let handler = handler.clone();
-            servers.spawn(async move { crate::transport::serve(&e, handler).await });
+        for (_, listener) in listeners {
+            servers.spawn(crate::transport::serve(listener, started.handler.clone()));
         }
-        while let Some(result) = servers.join_next().await {
-            result.map_err(|e| DevFailed::new("API_InternalError", e.to_string(), "Server::run"))??;
+        let result = tokio::select! {
+            r = servers.join_next() => match r {
+                Some(r) => r.map_err(|e| DevFailed::new("API_InternalError", e.to_string(), "Server::run")).and_then(|r| r),
+                None => Ok(()),
+            },
+            _ = started.shutdown.notified() => {
+                tokio::time::sleep(Duration::from_millis(100)).await; // let the Kill reply leave
+                Ok(())
+            }
+            _ = terminated() => Ok(()),
+        };
+        if let Store::Db(db, _) = &started.store {
+            db.unexport_server(&server_name).await?;
         }
-        Ok(())
+        result
     }
 
     /// Serves the devices on a Zenoh session with a full Zenoh configuration (routers to join,
@@ -482,24 +655,65 @@ impl Server {
     #[cfg(feature = "zenoh")]
     pub async fn run_zenoh(self, config: zenoh::Config) -> DevResult<()> {
         let session = crate::transport::zenoh::open(config).await?;
-        let handler = self.start(&session.zid().to_string())?;
-        crate::transport::zenoh::serve(session, handler).await
+        let started = self.start(&session.zid().to_string()).await?;
+        crate::transport::zenoh::serve(session, started.handler).await
     }
 
-    /// Initialises and exports the devices, starts polling and returns the request handler.
-    /// `host` is reported in DEVICE INFO. Must be called within a tokio runtime; `run` uses it,
-    /// a custom transport can use it directly.
-    pub fn start(self, host: &str) -> DevResult<Handler> {
-        let adm_name = format!("dserver/{}/{}", self.exec, self.instance);
-        let mut classes: Vec<_> = self.devices.iter().map(|(_, d)| d.class_name()).collect();
+    /// Creates and initialises the devices, starts polling and returns the request handler.
+    /// `endpoint` is the URL the devices will be exported with. `run` uses it; a custom
+    /// transport can use it directly.
+    pub async fn start(self, endpoint: &str) -> DevResult<Started> {
+        let server = format!("{}/{}", self.exec, self.instance);
+        let store = match self.config {
+            Config::NoDb => Store::None,
+            Config::Database(h) => Store::Db(Database::connect(&h).await?, h),
+            Config::File(p) => Store::File(Arc::new(DbFile::read(&p)?)),
+            Config::Auto => match tango_host() {
+                Some(h) => Store::Db(Database::connect(&h).await?, h),
+                None => Store::None,
+            },
+        };
+        let mut devices = self.devices;
+        if let Store::Db(db, _) = &store {
+            let registered: Vec<(String, String)> = devices.iter().map(|(n, d)| (n.clone(), d.class_name())).collect();
+            for (name, class) in registered {
+                db.add_device(&server, &name, &class).await?;
+            }
+        }
+        for (name, class) in store.devices(&server).await? {
+            if devices.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                continue;
+            }
+            match self.classes.get(&class) {
+                Some(factory) => devices.push((name, factory())),
+                None => eprintln!("{server}: no class {class} for device {name}, skipped"),
+            }
+        }
+
+        let adm_name = format!("dserver/{server}");
+        let mut classes: Vec<_> = devices.iter().map(|(_, d)| d.class_name()).collect();
+        classes.sort();
         classes.dedup();
-        let devices = self.devices.iter().map(|(n, d)| format!("{}::{n}", d.class_name())).collect();
-        let admin: Box<dyn Device> = Box::new(Admin { classes, devices });
+        let shutdown = Arc::new(Notify::new());
+        let names = devices.iter().map(|(n, d)| format!("{}::{n}", d.class_name())).collect();
+        let admin: Box<dyn Device> = Box::new(Admin { classes, devices: names, shutdown: shutdown.clone() });
 
         let mut entries = HashMap::new();
-        for (name, dev) in self.devices.into_iter().chain([(adm_name.clone(), admin)]) {
+        let mut exported = vec![];
+        for (name, dev) in devices.into_iter().chain([(adm_name.clone(), admin)]) {
             let mut entry = Entry::new(&name, dev);
-            entry.dev.init()?;
+            entry.store = store.clone();
+            let attrs: Vec<String> = entry.attrs.iter().map(|a| a.name.clone()).collect();
+            let stored = store.attribute_properties(&name, &attrs).await?;
+            for a in &mut entry.attrs {
+                if let Some(props) = stored.get(&a.name.to_lowercase()) {
+                    apply_attribute(a, props);
+                }
+            }
+            let (class, props) = (entry.class.clone(), entry.property_names());
+            let raw = store.properties(&name, &class, &props).await?;
+            entry.init(raw);
+            exported.push(name.clone());
             entries.insert(name.to_lowercase(), Arc::new(Mutex::new(entry)));
         }
         for (dev, obj, is_attr, period) in self.polling {
@@ -526,7 +740,30 @@ impl Server {
             });
         }
 
-        let server_id = format!("{}/{}", self.exec, self.instance);
-        Ok(Handler(Arc::new(Ctx { devices: entries, adm_name, server_id, host: host.into() })))
+        let ctx = Ctx { devices: entries, adm_name, server_id: server, host: endpoint_host(endpoint) };
+        Ok(Started { handler: Handler(Arc::new(ctx)), store, devices: exported, shutdown })
+    }
+}
+
+/// The host part of an endpoint URL, for DEVICE INFO.
+fn endpoint_host(endpoint: &str) -> String {
+    let rest = endpoint.split_once("://").map_or(endpoint, |(_, r)| r);
+    rest.rsplit_once(':').map_or(rest, |(h, _)| h).to_string()
+}
+
+/// SIGINT or SIGTERM.
+async fn terminated() {
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => drop(s.recv().await),
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term => {}
     }
 }
