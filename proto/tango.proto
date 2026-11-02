@@ -10,6 +10,8 @@ package tango.v1;
 service Device {
   // One Tango operation on one device.
   rpc Call(Request) returns (Reply);
+  // The events of some channels (SPEC §9.2), until the client cancels or the server stops.
+  rpc Subscribe(SubscribeRequest) returns (stream EventFrame);
 }
 
 enum Source {
@@ -30,4 +32,12 @@ message Request {
 message Reply {
   uint64 id = 1;
   bytes reply = 2;    // JSON {"Ok": Data} | {"Err": DevFailed}
+}
+
+message SubscribeRequest {
+  repeated string channels = 1;  // e.g. "sys/tg/1/ramp.change", "dserver/tgtest/test.heartbeat"
+}
+
+message EventFrame {
+  bytes event = 1;    // JSON Event (SPEC §9.3)
 }

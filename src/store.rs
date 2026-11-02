@@ -114,6 +114,12 @@ impl Store {
             ("max_alarm", num(a.max_alarm)),
             ("min_warning", num(a.min_warning)),
             ("max_warning", num(a.max_warning)),
+            ("abs_change", num(a.abs_change)),
+            ("rel_change", num(a.rel_change)),
+            ("period", a.period.map(|v| vec![v.to_string()])),
+            ("archive_abs_change", num(a.archive_abs_change)),
+            ("archive_rel_change", num(a.archive_rel_change)),
+            ("archive_period", a.archive_period.map(|v| vec![v.to_string()])),
         ]
         .map(|(n, v)| (n.to_string(), v));
         let (db, device, attr) = (db.clone(), device.to_string(), a.name.clone());
@@ -139,9 +145,18 @@ pub(crate) fn apply_attribute(a: &mut AttrInfo, props: &Raw) {
         (&mut a.max_alarm, "max_alarm"),
         (&mut a.min_warning, "min_warning"),
         (&mut a.max_warning, "max_warning"),
+        (&mut a.abs_change, "abs_change"),
+        (&mut a.rel_change, "rel_change"),
+        (&mut a.archive_abs_change, "archive_abs_change"),
+        (&mut a.archive_rel_change, "archive_rel_change"),
     ] {
         if let Some(v) = num(name) {
             *field = Some(v);
+        }
+    }
+    for (field, name) in [(&mut a.period, "period"), (&mut a.archive_period, "archive_period")] {
+        if let Some(v) = num(name) {
+            *field = Some(v as u64);
         }
     }
 }

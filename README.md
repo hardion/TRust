@@ -13,6 +13,7 @@ by detection of the wire (one `auto://` port for every wire, client-side probing
 * [`docs/BROWSER.md`](docs/BROWSER.md): the device browser and Starter interface (phase 2)
 * `apps/databaseds`: the Database device `sys/database/2` (RFC-6) on SQLite
 * `tests/validation.rs`: the validation suite run over every compiled transport, directly and through detection
+* `tests/events.rs`: the event suite (RFC-12) over every transport
 * `tests/wire_*.rs`: each wire driven without `DeviceProxy`, plus selection and detection tests
 
 | Feature | Transport | Client URL |
@@ -31,6 +32,13 @@ echo '{"v":1,"id":1,"device":"sys/tg/1","op":"DeviceName"}' | nc -q1 127.0.0.1 1
 cargo run --release --features full --example bench
 cargo run -p trust-databaseds --bin DataBaseds -- 2   # Database on auto://0.0.0.0:10000
 TANGO_HOST=localhost:10000 cargo run --features full --example tgtest auto://0.0.0.0:0   # registers and exports sys/tg/1
+```
+
+Events (RFC-12) work over every transport:
+
+```rust
+let mut events = dev.event_stream("double_scalar", EventType::Change).await?;
+while let Some(e) = events.recv().await { println!("{e:?}") }
 ```
 
 With a Database, devices are named like in Tango: `sys/tg/1` (through `$TANGO_HOST`),

@@ -6,6 +6,7 @@
 //! * **By detection of the wire** (`detect` feature): `auto://host:port` on the server accepts
 //!   every enabled TCP based wire on one port; on the client it probes the server's first bytes.
 
+use crate::events::Event;
 use crate::protocol::{Reply, Request};
 use crate::server::Handler;
 use crate::types::{DevFailed, DevResult};
@@ -130,6 +131,86 @@ pub(crate) async fn serve(listener: Listener, handler: Handler) -> DevResult<()>
         }
         #[allow(unreachable_patterns)]
         _ => unreachable!("checked by Scheme::parse"),
+    }
+}
+
+/// The server's events for which `keep` holds, until the server stops or the receiver is dropped.
+#[allow(dead_code)] // without a transport
+pub(crate) fn events(
+    handler: Handler,
+    keep: impl Fn(&Event) -> bool + Send + 'static,
+) -> tokio::sync::mpsc::Receiver<std::sync::Arc<Event>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(crate::events::BUFFER);
+    tokio::spawn(async move {
+        let mut events = handler.events();
+        loop {
+            tokio::select! {
+                e = events.recv() => match e {
+                    Ok(e) if keep(&e) => if tx.send(e).await.is_err() { break },
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {} // a gap the client sees
+                    Err(_) => break,
+                },
+                _ = handler.stopped() => break,
+            }
+        }
+    });
+    rx
+}
+
+/// The concrete endpoint URL: `auto://` is probed into a transport scheme.
+pub(crate) async fn resolve(endpoint: &str) -> DevResult<String> {
+    let (scheme, native) = Scheme::parse(endpoint)?;
+    #[cfg(feature = "detect")]
+    if scheme == Scheme::Auto {
+        return detect::probe(&native).await;
+    }
+    let _ = (scheme, native);
+    Ok(endpoint.to_string())
+}
+
+/// The client side of an event subscription, on the transport of `url` (SPEC §9.2).
+pub(crate) enum EventLink {
+    #[cfg(feature = "tcp")]
+    Tcp(tcp::EventLink),
+    #[cfg(feature = "zmq")]
+    Zmq(zmq::EventLink),
+    #[cfg(feature = "grpc")]
+    Grpc(grpc::EventLink),
+    #[cfg(feature = "zenoh")]
+    Zenoh(zenoh::EventLink),
+}
+
+impl EventLink {
+    /// `url` is a resolved endpoint URL; `zmq_endpoint` the PUB endpoint from SUBSCRIPTION_INFO.
+    #[allow(unused_variables)]
+    pub(crate) async fn connect(url: &str, zmq_endpoint: &str, channels: Vec<String>) -> DevResult<Self> {
+        let (scheme, native) = Scheme::parse(url)?;
+        Ok(match scheme {
+            #[cfg(feature = "tcp")]
+            Scheme::Tcp => Self::Tcp(tcp::EventLink::connect(&native, &channels).await?),
+            #[cfg(feature = "zmq")]
+            Scheme::Zmq => Self::Zmq(zmq::EventLink::connect(zmq_endpoint, &channels).await?),
+            #[cfg(feature = "grpc")]
+            Scheme::Grpc => Self::Grpc(grpc::EventLink::connect(&native, channels).await?),
+            #[cfg(feature = "zenoh")]
+            Scheme::Zenoh => Self::Zenoh(zenoh::EventLink::connect(&native, channels).await?),
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("resolved and checked by Scheme::parse"),
+        })
+    }
+
+    /// The next event of the subscribed channels.
+    pub(crate) async fn next(&mut self) -> DevResult<Event> {
+        match self {
+            #[cfg(feature = "tcp")]
+            Self::Tcp(l) => l.next().await,
+            #[cfg(feature = "zmq")]
+            Self::Zmq(l) => l.next().await,
+            #[cfg(feature = "grpc")]
+            Self::Grpc(l) => l.next().await,
+            #[cfg(feature = "zenoh")]
+            Self::Zenoh(l) => l.next().await,
+        }
     }
 }
 

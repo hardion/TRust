@@ -453,6 +453,10 @@ table:
 5. The client calls `EventConfirmSubscription([device, attribute, event_type])`
    every `confirm_period` (**200 s**); the server drops subscriptions not
    confirmed for 3 confirm periods (**600 s**, `Server::event_confirm`).
+   Each confirmation also makes the server publish a heartbeat at once: right
+   after connecting its event link, the client confirms until it sees that
+   heartbeat, so publish-subscribe links (ZeroMQ, Zenoh) are known to be live
+   before the first event, and no event published afterwards is missed.
 6. `"unsubscribe"` as the action cancels; the server stops publishing when
    no subscriber is left.
 
@@ -464,7 +468,11 @@ Channel names: `<device>/<attribute>.<event_type in lower case>`, e.g.
 | TCP JSON Lines | the client opens a second connection to the same endpoint whose first line is `{"subscribe": [channel, …]}`; the server then streams one JSON `Event` per line |
 | ZeroMQ | one `PUB` socket per server (bound next to the ROUTER, port chosen by the system); the ZeroMQ topic is the channel name; message = `[channel, json Event]` |
 | gRPC | server-streaming `rpc Subscribe(SubscribeRequest{repeated string channels}) returns (stream EventFrame{bytes event})` on the same service |
-| Zenoh | the server puts each event on key `tango/event/<channel>` (e.g. `tango/event/sys/tg/1/ramp.change`); clients subscribe to those keys on their session |
+| Zenoh | the server puts each event on key `tango/event/<channel>` (e.g. `tango/event/sys/tg/1/ramp.change`); a client subscribes to `tango/event/**` on its own session and keeps its channels |
+
+Heartbeat events carry `{"Ok": "Heartbeat"}`. Every server-side transport
+forwards events through a bounded buffer per subscriber; a slow subscriber
+loses the oldest events, and sees a sequence gap.
 
 ### 9.3 Event payload
 

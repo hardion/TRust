@@ -48,6 +48,26 @@ struct Service(Handler);
 
 #[tonic::async_trait]
 impl pb::device_server::Device for Service {
+    type SubscribeStream = tokio_stream::wrappers::ReceiverStream<Result<pb::EventFrame, Status>>;
+
+    async fn subscribe(
+        &self,
+        request: tonic::Request<pb::SubscribeRequest>,
+    ) -> Result<Response<Self::SubscribeStream>, Status> {
+        let channels = request.into_inner().channels;
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::events::BUFFER);
+        let mut events = crate::transport::events(self.0.clone(), move |e| channels.contains(&e.channel));
+        tokio::spawn(async move {
+            while let Some(e) = events.recv().await {
+                let event = serde_json::to_vec(&*e).expect("an event is always serialisable");
+                if tx.send(Ok(pb::EventFrame { event })).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+
     async fn call(&self, request: tonic::Request<pb::Request>) -> Result<Response<pb::Reply>, Status> {
         let peer = request.remote_addr().map_or_else(|| "grpc".into(), |a| a.to_string());
         let (r, handler) = (request.into_inner(), self.0.clone());
@@ -78,6 +98,21 @@ where
     let service = pb::device_server::DeviceServer::new(Service(handler));
     tonic::transport::Server::builder().add_service(service).serve_with_incoming(incoming).await?;
     Ok(())
+}
+
+/// The events of some channels, as a server stream.
+pub(crate) struct EventLink(tonic::Streaming<pb::EventFrame>);
+
+impl EventLink {
+    pub(crate) async fn connect(endpoint: &str, channels: Vec<String>) -> DevResult<Self> {
+        let mut client = pb::device_client::DeviceClient::connect(format!("http://{endpoint}")).await?;
+        Ok(Self(client.subscribe(pb::SubscribeRequest { channels }).await?.into_inner()))
+    }
+
+    pub(crate) async fn next(&mut self) -> DevResult<crate::events::Event> {
+        let frame = self.0.message().await?.ok_or_else(|| crate::client::bad_reply("event stream ended"))?;
+        Ok(serde_json::from_slice(&frame.event)?)
+    }
 }
 
 pub(crate) struct Link(pb::device_client::DeviceClient<Channel>);

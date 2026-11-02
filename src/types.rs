@@ -262,6 +262,17 @@ pub struct AttrInfo {
     pub max_alarm: Option<f64>,
     pub min_warning: Option<f64>,
     pub max_warning: Option<f64>,
+    /// CHANGE_EVENT thresholds (RFC-4): absolute, and relative in percent.
+    pub abs_change: Option<f64>,
+    pub rel_change: Option<f64>,
+    /// PERIODIC_EVENT period in ms (1000 when unset).
+    pub period: Option<u64>,
+    /// ARCHIVE_EVENT thresholds and period (ms).
+    pub archive_abs_change: Option<f64>,
+    pub archive_rel_change: Option<f64>,
+    pub archive_period: Option<u64>,
+    /// The device pushes CHANGE/ARCHIVE events itself: no polling or threshold needed.
+    pub events_by_code: bool,
 }
 
 impl AttrInfo {
