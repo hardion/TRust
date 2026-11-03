@@ -1,0 +1,22 @@
+[package]
+name = "trust-starter"
+version = "0.1.0"
+edition = "2024"
+description = "The Tango Starter device for TRust: starts, stops and monitors the device servers of a host"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "Starter"
+path = "src/main.rs"
+
+# a minimal device server started by the tests
+[[bin]]
+name = "TestServer"
+path = "src/bin/test_server.rs"
+
+[dependencies]
+trust = { path = "../..", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+trust-databaseds = { path = "../databaseds" }
