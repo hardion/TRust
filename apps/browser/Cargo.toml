@@ -1,0 +1,27 @@
+[package]
+name = "trust-browser"
+version = "0.1.0"
+edition = "2024"
+description = "Device browser and Starter interface for TRust (egui), with forms inferred from the device interface"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "trust-browser"
+path = "src/main.rs"
+
+# Demo devices to try the browser on; started by the tests through a Starter
+[[bin]]
+name = "DemoServer"
+path = "src/bin/demo_server.rs"
+
+[dependencies]
+trust = { path = "../..", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+serde_json = "1"
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+egui_plot = "0.38"
+
+[dev-dependencies]
+egui_kittest = "0.37"
+trust-databaseds = { path = "../databaseds" }
+trust-starter = { path = "../starter" }

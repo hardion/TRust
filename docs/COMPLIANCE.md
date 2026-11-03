@@ -34,7 +34,7 @@ of `docs/PLAN.md` §Phase 2), ⛔ out of scope (with reason).
 | Quality VALID/ALARM/WARNING | ✅ · CHANGING/INVALID set by device code ⛔ later phase (needs a quality in `read_attribute`) |
 | `READ_WITH_WRITE` + writable attribute name | ✅ |
 | Memorized attributes (`__value`) | ✅ stored on write, written back at export and DevRestart |
-| Enum labels | ✅ range check, editable, stored (browser display 🔨 M5) |
+| Enum labels | ✅ range check, editable, stored, shown and edited in the browser |
 | Forwarded attributes (`__root_att`) | ⛔ needs device-to-device proxying; later phase |
 | Attribute aliases | ✅ (Database; client-side resolution of attribute aliases ⛔ later phase) |
 
@@ -116,6 +116,6 @@ of `docs/PLAN.md` §Phase 2), ⛔ out of scope (with reason).
 | Item | Status |
 |---|---|
 | Starter device (`tango/admin/<host>`) | ✅ `apps/starter` (Unix-first: SIGKILL, `TANGO_HOST` for children) |
-| Device browser GUI with generic forms (egui) | 🔨 M5 |
-| Starter interface in the browser (Astor-like) | 🔨 M5 |
+| Device browser GUI with generic forms (egui) | ✅ `apps/browser` (see BROWSER.md §6 for what is left) |
+| Starter interface in the browser (Astor-like) | ✅ |
 | Access control (RFC-18), memorised attribute service (RFC-17), cache system (RFC-16) | ⛔ later phase |

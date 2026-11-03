@@ -1,8 +1,14 @@
 # TRust Browser — device browser and Starter interface
 
-`trust-browser` is a native desktop application written in Rust with
-**egui / eframe**; the same code also builds to WebAssembly. It talks to a
-control system only through `DeviceProxy`, so it works over every transport.
+`trust-browser` (`apps/browser`) is a native desktop application written in
+Rust with **egui / eframe**. It talks to a control system only through
+`DeviceProxy`, so it works over every transport. (A WebAssembly build would
+need a browser-side transport: not done.)
+
+```sh
+cargo run -p trust-browser -- localhost:10000        # or $TANGO_HOST
+cargo run -p trust-browser --bin DemoServer -- <instance>   # the Demo devices registered for DemoServer/<instance>
+```
 Every form is **inferred from the device's interface** (`CmdInfo`, `AttrInfo`,
 `PipeInfo`, `PropInfo`), so no device class needs GUI code.
 
@@ -40,7 +46,7 @@ type, so the rules below can be unit-tested without a GUI:
 | Data type / format | Display | Input widget |
 |---|---|---|
 | `Void` | — | none (command button only) |
-| `Boolean` | ✓ / ✗ | checkbox |
+| `Boolean` | true / false | checkbox |
 | integer types | number with `format` | drag value clamped to the type range and to `[min_value, max_value]` |
 | `Float`, `Double` | number with `format` and `unit` | text field parsed as float, with range check |
 | `String` | text | single-line text (multi-line if it contains `\n`) |
@@ -50,7 +56,7 @@ type, so the rules below can be unit-tested without a GUI:
 | `*Array`, SPECTRUM | inline list; plot (egui_plot) for numbers | comma-separated text, element-wise validation |
 | IMAGE | dimensions + greyscale heat map | not writable from the GUI |
 | `LongStringArray`, `DoubleStringArray` | two lists | two comma-separated fields |
-| Pipe blob | tree of key → value | tree editor for writable pipes |
+| Pipe blob | tree of key → value | JSON editor for writable pipes |
 
 * **Attributes tab**: one row per attribute: name (tooltip = description and
   label), read value, `w_value`, unit, quality colour (VALID green, ALARM red,
@@ -107,3 +113,24 @@ type, so the rules below can be unit-tested without a GUI:
   a Database and a Starter: open a device from the tree, write an attribute,
   execute a command, start and stop a server from the host panel. They
   assert on the accessibility tree, not on pixels.
+
+## 6. Status (M5)
+
+Implemented as above, with these differences:
+
+* Values without CHANGE events refresh every second (fixed period).
+* Spectrum attributes are plotted inline; the trend plot of a scalar on click,
+  the IMAGE heat map (dimensions only for now), aliases in the tree and the
+  property history are not done yet.
+* Writable pipes are edited as JSON (the blob read last is the template).
+* Text is plain ASCII/Latin (state and quality lights are drawn shapes), so
+  any font renders it and the headless tests need no extra font.
+
+Tests: `form.rs` unit tests (widgets, texts, parsing with range errors, round
+trips), `app.rs` unit tests (tree filter, Starter lines), and two
+`egui_kittest` tests in `tests/ui.rs` against a live Database, a `DemoServer`
+and a Starter: open a device from the tree, read and write attributes
+(including the alarm-limit confirmation and a `max_value` refusal), run a
+command, read a pipe and the properties, show the black box; start, stop and
+read the log of a server from the host panel, list its devices, register a
+new server.
