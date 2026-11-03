@@ -554,20 +554,29 @@ pipe name.
   device servers registered for its host in the Database
   (`DbGetHostServersInfo`: server, controlled flag, startup level).
 * Device properties: `StartDsPath` (directories holding the executables),
-  `WaitForDriverStartup`, `InterStartupLevelWait` (s), `ServerStartupTimeout`
-  (s), `StartServersAtStartup` (bool), `LogFileHome`, `KeepLogFiles`.
+  `InterStartupLevelWait` (s, default 1), `ServerStartupTimeout` (s, default
+  60), `StartServersAtStartup` (bool, default true), `LogFileHome` (default the
+  temporary directory), `KeepLogFiles` (previous logs kept as `.log.1`,
+  `.log.2`…, default 3). Servers are started with `TANGO_HOST` set to the
+  Starter's Database.
 * A server is *running* when its admin device answers a ping, *starting*
-  until then (up to `ServerStartupTimeout`), *stopped* otherwise; a
-  controlled server that dies is reported (state `ALARM`) but not restarted
-  (Tango behaviour).
+  from `DevStart` until then (up to `ServerStartupTimeout`), *stopped*
+  otherwise; while its process lives, a server that does not answer keeps its
+  state. A controlled server that dies is logged (`<server> died (<exit
+  status>)` in the Starter's log) and reported (state `ALARM`) but not
+  restarted (Tango behaviour).
+* At startup (`StartServersAtStartup`), the controlled servers of levels ≥ 1
+  are started level by level: a level starts once every server of the previous
+  one runs (or after `ServerStartupTimeout`), then `InterStartupLevelWait`.
+  Level 0 servers are never started automatically.
 
 | Command | In → Out | Behaviour |
 |---|---|---|
-| `DevStart` | String → Void | starts `<exec> <instance>` from `StartDsPath`, stdout/stderr to `LogFileHome/<exec>_<instance>.log` |
-| `DevStop` | String → Void | `Kill` on the server's admin device |
-| `HardKillServer` | String → Void | kills the process (SIGKILL) |
-| `DevStartAll` | Short → Void | starts every controlled server of a startup level, waiting `InterStartupLevelWait` between levels |
-| `DevStopAll` | Short → Void | stops every server of a level |
+| `DevStart` | String → Void | starts `<exec> <instance>` from `StartDsPath`, stdout/stderr to `LogFileHome/<exec>_<instance>.log`; `API_ServerRunning`, `API_ExecutableNotFound` |
+| `DevStop` | String → Void | `Kill` on the server's admin device; `API_ServerNotRunning` |
+| `HardKillServer` | String → Void | kills the process (SIGKILL); `API_ProcessNotFound` if not started by this Starter |
+| `DevStartAll` | Short → Void | starts the stopped controlled servers of a startup level (in the background) |
+| `DevStopAll` | Short → Void | stops every running server of a level |
 | `DevGetRunningServers`, `DevGetStopServers` | Boolean (controlled only) → StringArray | |
 | `DevReadLog` | String → String | the server's log file (`"Starter"` = the Starter's own log) |
 | `UpdateServersInfo` | Void → Void | re-reads the Database |
@@ -575,7 +584,7 @@ pipe name.
 | Attribute | Type | Content |
 |---|---|---|
 | `HostState` | Short | 0 ON, 1 MOVING (a server starting), 2 ALARM (a controlled server stopped) |
-| `Servers` | StringArray | `name\tstate\tcontrolled\tlevel\tnb_instances` per server |
+| `Servers` | StringArray | `name\tstate\tcontrolled\tlevel\tnb_instances` per server; state `ON` (running), `MOVING` (starting) or `FAULT` (stopped) |
 | `RunningServers`, `StoppedServers` | StringArray | |
 
 Changes of `Servers` and `HostState` are pushed as CHANGE events.
