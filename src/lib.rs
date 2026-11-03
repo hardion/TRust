@@ -17,7 +17,7 @@ mod types;
 pub use client::DeviceProxy;
 pub use db::{DATABASE_DEVICE, Database, hostname};
 pub use dbfile::DbFile;
-pub use events::{Event, EventData, EventSink, EventStream, EventType, Subscription};
+pub use events::{Event, EventData, EventSink, EventStream, EventType, LogLevel, Subscription};
 pub use props::{PropInfo, Properties, parse_value, valid_property_name};
 pub use protocol::*;
 pub use server::{Device, Handler, Server, Started};

@@ -14,6 +14,7 @@ by detection of the wire (one `auto://` port for every wire, client-side probing
 * `apps/databaseds`: the Database device `sys/database/2` (RFC-6) on SQLite
 * `tests/validation.rs`: the validation suite run over every compiled transport, directly and through detection
 * `tests/events.rs`: the event suite (RFC-12) over every transport
+* `tests/admin.rs`: the admin device (polling, restart, locking, logging) and the attribute model
 * `tests/wire_*.rs`: each wire driven without `DeviceProxy`, plus selection and detection tests
 
 | Feature | Transport | Client URL |
@@ -40,6 +41,11 @@ Events (RFC-12) work over every transport:
 let mut events = dev.event_stream("double_scalar", EventType::Change).await?;
 while let Some(e) = events.recv().await { println!("{e:?}") }
 ```
+
+The admin device `dserver/<server>/<instance>` drives the server at run time (SPEC §8): polling
+(`AddObjPolling`, saved in the Database), `DevRestart`, locking (`dev.lock(validity)`), and
+logging (`AddLoggingTarget dev file::/tmp/dev.log`, `SetLoggingLevel`; devices log through
+`EventSink::log`).
 
 With a Database, devices are named like in Tango: `sys/tg/1` (through `$TANGO_HOST`),
 `tango://host:10000/sys/tg/1`, an alias, or `tango://host:port/sys/tg/1#dbase=no` without it.

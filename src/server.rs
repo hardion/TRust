@@ -2,7 +2,7 @@
 
 use crate::db::{Database, hostname, tango_host};
 use crate::dbfile::DbFile;
-use crate::events::{self, EventData, EventSink, EventType, Hub};
+use crate::events::{self, EventData, EventSink, EventType, Hub, LogLevel};
 use crate::props::{PropInfo, Properties};
 use crate::protocol::*;
 use crate::store::{Raw, Store, apply_attribute};
@@ -10,8 +10,9 @@ use crate::transport::Scheme;
 use crate::types::*;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, watch};
 
 const BLACK_BOX_DEPTH: usize = 50;
@@ -135,14 +136,22 @@ struct Entry {
     black_box: VecDeque<BlackBoxRecord>,
     cmd_ring: Ring<Value>,
     attr_ring: Ring<AttrValue>,
+    /// Per polled `(is_attribute, name)`: when it was last polled, how long it took (s), the error.
+    poll_stats: HashMap<(bool, String), (f64, f64, Option<String>)>,
+}
+
+/// The commands and attributes of a device, those provided by the server included.
+fn interface(dev: &dyn Device) -> (Vec<CmdInfo>, Vec<AttrInfo>) {
+    let cmd = |name: &str, out_type| CmdInfo { name: name.into(), out_type, ..Default::default() };
+    let attr = |name: &str, data_type| AttrInfo { name: name.into(), data_type, ..Default::default() };
+    let cmds = [cmd("Init", DataType::Void), cmd("State", DataType::State), cmd("Status", DataType::String)];
+    let attrs = [attr("State", DataType::State), attr("Status", DataType::String)];
+    (cmds.into_iter().chain(dev.commands()).collect(), attrs.into_iter().chain(dev.attributes()).collect())
 }
 
 impl Entry {
     fn new(name: &str, dev: Box<dyn Device>) -> Self {
-        let cmd = |name: &str, out_type| CmdInfo { name: name.into(), out_type, ..Default::default() };
-        let attr = |name: &str, data_type| AttrInfo { name: name.into(), data_type, ..Default::default() };
-        let cmds = [cmd("Init", DataType::Void), cmd("State", DataType::State), cmd("Status", DataType::String)];
-        let attrs = [attr("State", DataType::State), attr("Status", DataType::String)];
+        let (cmds, attrs) = interface(&*dev);
         Self {
             name: name.into(),
             class: dev.class_name(),
@@ -150,14 +159,15 @@ impl Entry {
             fault: None,
             hub: Arc::new(Hub::new(events::HEARTBEAT, events::CONFIRM)),
             last_events: HashMap::new(),
-            cmds: cmds.into_iter().chain(dev.commands()).collect(),
-            attrs: attrs.into_iter().chain(dev.attributes()).collect(),
+            cmds,
+            attrs,
             pipes: dev.pipes(),
             dev,
             w_values: HashMap::new(),
             black_box: VecDeque::new(),
             cmd_ring: HashMap::new(),
             attr_ring: HashMap::new(),
+            poll_stats: HashMap::new(),
         }
     }
 
@@ -180,10 +190,44 @@ impl Entry {
     fn reinit(&mut self) -> DevResult<()> {
         let raw = self.store.properties_blocking(&self.name, &self.class, &self.property_names())?;
         self.init(raw);
-        let interface =
-            EventData::Interface { commands: self.cmds.clone(), attributes: self.attrs.clone(), started: true };
+        self.refresh_interface(true);
+        Ok(())
+    }
+
+    /// Re-reads the interface of the device, keeping the configuration of the attributes already
+    /// known, and sends INTERFACE_CHANGE (`started`: after an Init or a restart).
+    fn refresh_interface(&mut self, started: bool) {
+        let (cmds, attrs) = interface(&*self.dev);
+        let known =
+            |a: AttrInfo| self.attrs.iter().find(|o| o.name.eq_ignore_ascii_case(&a.name)).cloned().unwrap_or(a);
+        let attrs = attrs.into_iter().map(known).collect();
+        (self.cmds, self.attrs, self.pipes) = (cmds, attrs, self.dev.pipes());
+        let interface = EventData::Interface { commands: self.cmds.clone(), attributes: self.attrs.clone(), started };
         let channel = events::channel(&self.name, "", EventType::InterfaceChange);
         self.hub.publish(&channel, EventType::InterfaceChange, Ok(interface));
+    }
+
+    /// Writes set values back to the device (memorized attributes), keeping those it accepts.
+    fn restore(&mut self, values: Vec<(String, Value)>) {
+        for (name, value) in values {
+            if self.dev.write_attribute(&name, value.clone()).is_ok() {
+                self.w_values.insert(name, value);
+            }
+        }
+    }
+
+    /// DevRestart: a new device of the class replaces this one; memorized set values, polling
+    /// and attribute configuration are kept.
+    fn restart(&mut self, mut dev: Box<dyn Device>, sink: EventSink) -> DevResult<()> {
+        dev.attach(sink);
+        self.dev = dev;
+        let memorized: Vec<_> =
+            self.w_values.drain().filter(|(n, _)| self.attrs.iter().any(|a| a.memorized && a.name == *n)).collect();
+        self.last_events.clear();
+        let raw = self.store.properties_blocking(&self.name, &self.class, &self.property_names())?;
+        self.init(raw);
+        self.restore(memorized);
+        self.refresh_interface(true);
         Ok(())
     }
 
@@ -239,7 +283,10 @@ impl Entry {
             "Status" => Value::String(self.status()),
             name => self.dev.read_attribute(name)?,
         };
-        Ok(info.value(value, self.w_values.get(&info.name).cloned()))
+        // a READ_WITH_WRITE attribute reports the set value of its writable attribute
+        let set = if info.writable_attr_name.is_empty() { &info.name } else { &info.writable_attr_name };
+        let w_value = self.w_values.iter().find(|(n, _)| n.eq_ignore_ascii_case(set)).map(|(_, v)| v.clone());
+        Ok(info.value(value, w_value))
     }
 
     fn read_attrs(&mut self, names: &[String], source: Source) -> Vec<DevResult<AttrValue>> {
@@ -255,8 +302,13 @@ impl Entry {
     }
 
     fn write_attrs(&mut self, values: Vec<(String, Value)>) -> DevResult<()> {
-        let errors: Vec<_> =
-            values.into_iter().filter_map(|(n, v)| self.write_attr(&n, v).err()).flat_map(|e| e.0).collect();
+        // one error per failed attribute, its origin naming the attribute (MultiDevFailed)
+        let mut errors = vec![];
+        for (name, value) in values {
+            if let Err(e) = self.write_attr(&name, value) {
+                errors.extend(e.0.into_iter().map(|e| DevError { origin: name.clone(), ..e }));
+            }
+        }
         if errors.is_empty() { Ok(()) } else { Err(DevFailed(errors)) }
     }
 
@@ -277,8 +329,15 @@ impl Entry {
         if value.outside(info.min_value, info.max_value) {
             return fail("API_WAttrOutsideLimit", "value outside [min_value, max_value]");
         }
-        let name = info.name.clone();
+        let labels = info.enum_labels.len();
+        if labels > 0 && matches!(value, Value::Short(v) if v < 0 || v as usize >= labels) {
+            return fail("API_WAttrOutsideLimit", "value is not an index of enum_labels");
+        }
+        let (name, memorized) = (info.name.clone(), info.memorized);
         self.dev.write_attribute(&name, value.clone())?;
+        if memorized {
+            self.store.save_memorized(&self.name, &name, &value)?;
+        }
         self.w_values.insert(name, value);
         Ok(())
     }
@@ -307,6 +366,8 @@ impl Entry {
             max_dim_y: a.max_dim_y,
             disp_level: a.disp_level,
             events_by_code: a.events_by_code,
+            memorized: a.memorized,
+            writable_attr_name: a.writable_attr_name.clone(),
             ..c
         };
         self.store.save_attribute(&self.name, a);
@@ -329,16 +390,23 @@ impl Entry {
         self.dev.write_pipe(&name, blob)
     }
 
-    fn poll(&mut self, obj: &str) {
+    fn poll(&mut self, obj: &str, is_attr: bool) {
         let time = now();
-        if self.attr_ring.contains_key(obj) {
+        let error = if is_attr {
             let value = self.read_attr(obj);
             self.fire_polled(obj, &value);
-            push(self.attr_ring.get_mut(obj).unwrap(), History { time, value }, POLL_RING_DEPTH);
+            let error = value.as_ref().err().map(DevFailed::to_string);
+            let Some(ring) = self.attr_ring.get_mut(obj) else { return };
+            push(ring, History { time, value }, POLL_RING_DEPTH);
+            error
         } else {
             let value = self.execute(obj, Value::Void);
-            push(self.cmd_ring.get_mut(obj).unwrap(), History { time, value }, POLL_RING_DEPTH);
-        }
+            let error = value.as_ref().err().map(DevFailed::to_string);
+            let Some(ring) = self.cmd_ring.get_mut(obj) else { return };
+            push(ring, History { time, value }, POLL_RING_DEPTH);
+            error
+        };
+        self.poll_stats.insert((is_attr, obj.into()), (time, now() - time, error));
     }
 
     /// CHANGE, PERIODIC and ARCHIVE events of a polled attribute (SPEC §9.1).
@@ -482,27 +550,58 @@ impl Device for Admin {
         DevState::On
     }
     fn commands(&self) -> Vec<CmdInfo> {
-        let cmd = |name: &str, out_type| CmdInfo { name: name.into(), out_type, ..Default::default() };
-        vec![
-            cmd("QueryClass", DataType::StringArray),
-            cmd("QueryDevice", DataType::StringArray),
-            cmd("Kill", DataType::Void),
-            CmdInfo { in_type: DataType::StringArray, ..cmd("EventSubscriptionChange", DataType::LongStringArray) },
-            CmdInfo { in_type: DataType::StringArray, ..cmd("ZmqEventSubscriptionChange", DataType::LongStringArray) },
-            CmdInfo { in_type: DataType::StringArray, ..cmd("EventConfirmSubscription", DataType::Void) },
-        ]
+        use DataType::{Long, LongStringArray as Lsa, String as Str, StringArray as Sa, Void};
+        let table = [
+            ("QueryClass", Void, Sa),
+            ("QueryDevice", Void, Sa),
+            ("QuerySubDevice", Void, Sa),
+            ("QueryWizardClassProperty", Str, Sa),
+            ("QueryWizardDevProperty", Str, Sa),
+            ("Kill", Void, Void),
+            ("DevRestart", Str, Void),
+            ("RestartServer", Void, Void),
+            ("AddObjPolling", Lsa, Void),
+            ("UpdObjPollingPeriod", Lsa, Void),
+            ("RemObjPolling", Sa, Void),
+            ("PolledDevice", Void, Sa),
+            ("DevPollStatus", Str, Sa),
+            ("StartPolling", Void, Void),
+            ("StopPolling", Void, Void),
+            ("LockDevice", Lsa, Void),
+            ("ReLockDevices", Sa, Void),
+            ("UnLockDevice", Lsa, Long),
+            ("DevLockStatus", Str, Lsa),
+            ("AddLoggingTarget", Sa, Void),
+            ("RemoveLoggingTarget", Sa, Void),
+            ("GetLoggingTarget", Str, Sa),
+            ("SetLoggingLevel", Lsa, Void),
+            ("GetLoggingLevel", Sa, Lsa),
+            ("StartLogging", Void, Void),
+            ("StopLogging", Void, Void),
+            ("EventSubscriptionChange", Sa, Lsa),
+            ("ZmqEventSubscriptionChange", Sa, Lsa),
+            ("EventConfirmSubscription", Sa, Void),
+        ];
+        table
+            .map(|(name, in_type, out_type)| CmdInfo { name: name.into(), in_type, out_type, ..Default::default() })
+            .into()
     }
+    /// QueryClass, QueryDevice and Kill; the others are handled by `Ctx::admin_command`.
     fn execute(&mut self, cmd: &str, _arg: Value) -> DevResult<Value> {
         Ok(match cmd {
             "QueryClass" => Value::StringArray(self.classes.clone()),
             "QueryDevice" => Value::StringArray(self.devices.clone()),
-            _ => {
-                self.shutdown.notify_one(); // Kill: the reply leaves before the server stops
+            "Kill" => {
+                self.shutdown.notify_one(); // the reply leaves before the server stops
                 Value::Void
             }
+            _ => return Err(unsupported(cmd)),
         })
     }
 }
+
+/// Admin commands answered by the device itself (or by every device).
+const DEVICE_COMMANDS: [&str; 6] = ["Init", "State", "Status", "QueryClass", "QueryDevice", "Kill"];
 
 type Shared = Arc<Mutex<Entry>>;
 
@@ -517,6 +616,49 @@ struct Ctx {
     host: String,
     hub: Arc<Hub>,
     stop: watch::Sender<bool>,
+    store: Store,
+    classes: HashMap<String, Factory>,
+    rt: tokio::runtime::Handle,
+    /// Per `(device, is_attribute, name)` in lower case.
+    polls: Mutex<HashMap<(String, bool, String), Poll>>,
+    /// StopPolling: the polling tasks skip their ticks.
+    paused: Arc<AtomicBool>,
+    /// Per device in lower case.
+    locks: Mutex<HashMap<String, DevLock>>,
+}
+
+struct Poll {
+    device: String,
+    name: String,
+    period: Duration,
+    task: tokio::task::AbortHandle,
+}
+
+#[derive(Clone)]
+struct DevLock {
+    client: u64,
+    host: String,
+    validity: Duration,
+    until: Instant,
+}
+
+fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Requests a locked device refuses to other clients: commands other than State and Status,
+/// writes and configuration changes.
+fn mutating(op: &Op) -> bool {
+    match op {
+        Op::CommandExecution { name, .. } => !["State", "Status"].iter().any(|n| n.eq_ignore_ascii_case(name)),
+        Op::AttributesWrite { .. }
+        | Op::AttributesWriteRead { .. }
+        | Op::AttributeSetConfig { .. }
+        | Op::PipeWrite { .. }
+        | Op::PipeWriteRead { .. }
+        | Op::PipeSetConfig { .. } => true,
+        _ => false,
+    }
 }
 
 impl Ctx {
@@ -525,26 +667,354 @@ impl Ctx {
             let desc = format!("protocol version {} not supported, expected {PROTOCOL_VERSION}", req.v);
             return Err(DevFailed::new("API_UnsupportedProtocol", desc, "Server"));
         }
-        if let Op::CommandExecution { name, arg } = &req.op
-            && req.device.eq_ignore_ascii_case(&self.adm_name)
-            && name.contains("Subscription")
-        {
-            return self.event_command(name, arg).map(Data::Value);
+        let key = req.device.to_lowercase();
+        let entry = self.entry(&key)?;
+        if mutating(&req.op) {
+            self.check_lock(&key, req.client)?;
         }
-        let entry = self.devices.get(&req.device.to_lowercase());
-        let entry =
-            entry.ok_or_else(|| DevFailed::new("API_DeviceNotFound", format!("{} not found", req.device), "Server"))?;
-        let mut e = lock(entry);
         let op = format!("{:?}", req.op);
-        let record = BlackBoxRecord {
-            time: now(),
-            operation: op.split([' ', '(']).next().unwrap_or_default().into(),
-            source: req.source,
-            client_id: req.client,
-            host: host.into(),
+        let operation = op.split([' ', '(']).next().unwrap_or_default().to_string();
+        let what = match &req.op {
+            Op::CommandExecution { name, .. } => format!("{operation} {name}"),
+            _ => operation.clone(),
         };
+        self.hub.log(&key, LogLevel::Debug, &format!("{what} from {host}"));
+        let mut e = lock(entry);
+        let record =
+            BlackBoxRecord { time: now(), operation, source: req.source, client_id: req.client, host: host.into() };
         push(&mut e.black_box, record, BLACK_BOX_DEPTH);
-        e.handle(req.op, req.source, self)
+        if key == self.adm_name.to_lowercase()
+            && let Op::CommandExecution { name, arg } = &req.op
+            && !DEVICE_COMMANDS.iter().any(|c| c.eq_ignore_ascii_case(name))
+        {
+            let info = e.cmds[find(&e.cmds, name, "API_CommandNotFound")?].clone();
+            drop(e); // the admin commands reach into the other devices
+            if arg.data_type() != info.in_type {
+                let desc = format!("{} expects {:?}, got {:?}", info.name, info.in_type, arg.data_type());
+                return Err(DevFailed::new("API_IncompatibleCmdArgumentType", desc, "Command"));
+            }
+            return self.admin_command(&info.name, arg, req.client, host).map(Data::Value);
+        }
+        let result = e.handle(req.op, req.source, self);
+        if self.hub.take_interface_changed(&e.name) {
+            e.refresh_interface(false);
+        }
+        result
+    }
+
+    fn entry(&self, device: &str) -> DevResult<&Shared> {
+        let not_found = || DevFailed::new("API_DeviceNotFound", format!("{device} not found"), "Server");
+        self.devices.get(&device.to_lowercase()).ok_or_else(not_found)
+    }
+
+    /// The admin commands of SPEC §8 that act on the server rather than on one device.
+    fn admin_command(&self, name: &str, arg: &Value, client: u64, host: &str) -> DevResult<Value> {
+        let (longs, strings) = match arg {
+            Value::LongStringArray(l, s) => (l.clone(), s.clone()),
+            Value::StringArray(s) => (vec![], s.clone()),
+            Value::String(s) => (vec![], vec![s.clone()]),
+            _ => (vec![], vec![]),
+        };
+        let s = |i: usize| strings.get(i).map(String::as_str).unwrap_or_default();
+        let long = |i: usize| longs.get(i).copied().unwrap_or_default();
+        let invalid = |desc: &str| DevFailed::new("API_InvalidArgs", desc, name);
+        let period = || match long(0) {
+            p if p > 0 => Ok(Duration::from_millis(p as u64)),
+            _ => Err(invalid("the polling period must be > 0 ms")),
+        };
+        let list = Value::StringArray;
+        let void = |r: DevResult<()>| r.map(|_| Value::Void);
+        match name {
+            n if n.contains("Subscription") => self.event_command(n, arg),
+            "QuerySubDevice" | "QueryWizardClassProperty" => Ok(list(vec![])),
+            "QueryWizardDevProperty" => self.wizard(s(0)).map(list),
+            "AddObjPolling" => void(self.add_poll(s(0), s(1), s(2), period()?, true)),
+            "UpdObjPollingPeriod" => void(self.update_poll(s(0), s(1), s(2), Some(period()?))),
+            "RemObjPolling" => void(self.update_poll(s(0), s(1), s(2), None)),
+            "PolledDevice" => {
+                let mut devices: Vec<_> = guard(&self.polls).values().map(|p| p.device.clone()).collect();
+                devices.sort();
+                devices.dedup();
+                Ok(list(devices))
+            }
+            "DevPollStatus" => self.poll_status(s(0)).map(list),
+            "StartPolling" | "StopPolling" => {
+                self.paused.store(name == "StopPolling", Ordering::Relaxed);
+                Ok(Value::Void)
+            }
+            "DevRestart" => void(self.restart(s(0))),
+            "RestartServer" => {
+                let mut devices: Vec<_> = self.devices.keys().filter(|d| **d != self.adm_name.to_lowercase()).collect();
+                devices.sort();
+                devices.into_iter().try_for_each(|d| self.restart(d)).map(|_| Value::Void)
+            }
+            "LockDevice" => void(self.lock_device(s(0), client, host, long(0))),
+            "ReLockDevices" => void(strings.iter().try_for_each(|d| self.relock(d, client))),
+            "UnLockDevice" => self.unlock(&strings, client, long(0) == 1),
+            "DevLockStatus" => self.lock_status(s(0)),
+            "AddLoggingTarget" | "RemoveLoggingTarget" => {
+                for pair in strings.chunks(2) {
+                    let [device, target] = pair else { return Err(invalid("expected device, target pairs")) };
+                    self.entry(device)?;
+                    let mut logging = guard(&self.hub.logging);
+                    let targets = &mut logging.device(device).1;
+                    targets.retain(|t| t != target);
+                    if name == "AddLoggingTarget" {
+                        targets.push(target.clone());
+                    }
+                }
+                Ok(Value::Void)
+            }
+            "GetLoggingTarget" => {
+                self.entry(s(0))?;
+                Ok(list(guard(&self.hub.logging).device(s(0)).1.clone()))
+            }
+            "SetLoggingLevel" => {
+                for (level, device) in longs.iter().zip(&strings) {
+                    let level = LogLevel::from_i32(*level).ok_or_else(|| invalid("levels are 0 (OFF) to 5 (DEBUG)"))?;
+                    self.entry(device)?;
+                    guard(&self.hub.logging).device(device).0 = level;
+                }
+                Ok(Value::Void)
+            }
+            "GetLoggingLevel" => {
+                let mut levels = vec![];
+                for device in &strings {
+                    self.entry(device)?;
+                    levels.push(guard(&self.hub.logging).device(device).0 as i32);
+                }
+                Ok(Value::LongStringArray(levels, strings))
+            }
+            "StartLogging" | "StopLogging" => {
+                guard(&self.hub.logging).enabled = name == "StartLogging";
+                Ok(Value::Void)
+            }
+            _ => Err(unsupported(name)),
+        }
+    }
+
+    /// `[name, description, default]` per device property of `class`.
+    fn wizard(&self, class: &str) -> DevResult<Vec<String>> {
+        let props = match self.classes.iter().find(|(c, _)| c.eq_ignore_ascii_case(class)) {
+            Some((_, factory)) => factory().properties(),
+            None => self
+                .devices
+                .values()
+                .find_map(|e| {
+                    let e = lock(e);
+                    e.class.eq_ignore_ascii_case(class).then(|| e.dev.properties())
+                })
+                .ok_or_else(|| DevFailed::new("API_ClassNotFound", format!("{class} not found"), "QueryWizard"))?,
+        };
+        Ok(props.into_iter().flat_map(|p| [p.name, p.description, p.default.unwrap_or_default().join("\n")]).collect())
+    }
+
+    /// `(key, entry, name, is_attribute)` of a polling object `<device> attribute|command <name>`.
+    fn poll_target(&self, device: &str, kind: &str, obj: &str) -> DevResult<((String, bool, String), Shared, String)> {
+        let entry = self.entry(device)?;
+        let e = lock(entry);
+        let name = match kind.to_lowercase().as_str() {
+            "attribute" => e.attrs[find(&e.attrs, obj, "API_AttrNotFound")?].name.clone(),
+            "command" => e.cmds[find(&e.cmds, obj, "API_CommandNotFound")?].name.clone(),
+            _ => return Err(DevFailed::new("API_NotSupported", format!("{kind}: attribute or command"), "Polling")),
+        };
+        let key = (device.to_lowercase(), kind.eq_ignore_ascii_case("attribute"), name.to_lowercase());
+        Ok((key, entry.clone(), name))
+    }
+
+    fn add_poll(&self, device: &str, kind: &str, obj: &str, period: Duration, save: bool) -> DevResult<()> {
+        let (key, entry, name) = self.poll_target(device, kind, obj)?;
+        let mut polls = guard(&self.polls);
+        if polls.contains_key(&key) {
+            return Err(DevFailed::new("API_AlreadyPolled", format!("{name} is already polled"), "AddObjPolling"));
+        }
+        let device = {
+            let mut e = lock(&entry);
+            match key.1 {
+                true => drop(e.attr_ring.insert(name.clone(), VecDeque::new())),
+                false => drop(e.cmd_ring.insert(name.clone(), VecDeque::new())),
+            }
+            e.name.clone()
+        };
+        let task = self.spawn_poll(entry, name.clone(), key.1, period);
+        polls.insert(key.clone(), Poll { device, name, period, task });
+        drop(polls);
+        if save { self.save_polling(&key.0) } else { Ok(()) }
+    }
+
+    /// A new period (UpdObjPollingPeriod), or `None` to stop polling (RemObjPolling).
+    fn update_poll(&self, device: &str, kind: &str, obj: &str, period: Option<Duration>) -> DevResult<()> {
+        let (key, entry, name) = self.poll_target(device, kind, obj)?;
+        let mut polls = guard(&self.polls);
+        let not_polled = || DevFailed::new("API_NotPolled", format!("{name} is not polled"), "Polling");
+        let poll = polls.get_mut(&key).ok_or_else(not_polled)?;
+        poll.task.abort();
+        match period {
+            Some(period) => {
+                poll.period = period;
+                poll.task = self.spawn_poll(entry, name, key.1, period);
+            }
+            None => {
+                polls.remove(&key);
+                let mut e = lock(&entry);
+                match key.1 {
+                    true => drop(e.attr_ring.remove(&name)),
+                    false => drop(e.cmd_ring.remove(&name)),
+                }
+                e.poll_stats.remove(&(key.1, name));
+            }
+        }
+        drop(polls);
+        self.save_polling(&key.0)
+    }
+
+    fn spawn_poll(&self, entry: Shared, obj: String, is_attr: bool, period: Duration) -> tokio::task::AbortHandle {
+        let (mut stopped, paused) = (self.stop.subscribe(), self.paused.clone());
+        let task = self.rt.spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => if !paused.load(Ordering::Relaxed) {
+                        lock(&entry).poll(&obj, is_attr)
+                    },
+                    _ = stopped.wait_for(|s| *s) => break,
+                }
+            }
+        });
+        task.abort_handle()
+    }
+
+    /// Persists the polling configuration of a device: `polled_attr`, `polled_cmd`.
+    fn save_polling(&self, device: &str) -> DevResult<()> {
+        let mut polled: Vec<_> = guard(&self.polls)
+            .iter()
+            .filter(|((d, ..), _)| d == device)
+            .map(|((_, attr, _), p)| (*attr, p.name.clone(), p.period.as_millis().to_string()))
+            .collect();
+        polled.sort();
+        let (mut attrs, mut cmds) = (vec![], vec![]);
+        for (attr, name, period) in polled {
+            (if attr { &mut attrs } else { &mut cmds }).extend([name, period]);
+        }
+        let name = lock(self.entry(device)?).name.clone();
+        self.store.save_polling(&name, attrs, cmds)
+    }
+
+    fn poll_status(&self, device: &str) -> DevResult<Vec<String>> {
+        let entry = self.entry(device)?;
+        let mut polled: Vec<_> = guard(&self.polls)
+            .iter()
+            .filter(|((d, ..), _)| d.eq_ignore_ascii_case(device))
+            .map(|((_, attr, _), p)| (*attr, p.name.clone(), p.period))
+            .collect();
+        polled.sort();
+        let e = lock(entry);
+        let status = |(attr, name, period): (bool, String, Duration)| {
+            let kind = if attr { "attribute" } else { "command" };
+            let mut s = format!(
+                "Polled {kind} name = {name}\nPolling period (mS) = {}\nPolling ring buffer depth = {POLL_RING_DEPTH}",
+                period.as_millis()
+            );
+            if let Some((time, took, error)) = e.poll_stats.get(&(attr, name)) {
+                s += &format!("\nTime needed for the last {kind} reading (mS) = {:.3}", took * 1000.0);
+                s += &format!("\nLast record taken {:.0} mS ago", (now() - time) * 1000.0);
+                if let Some(error) = error {
+                    s += &format!("\nLast {kind} read FAILED :\n{error}");
+                }
+            }
+            s
+        };
+        Ok(polled.into_iter().map(status).collect())
+    }
+
+    fn restart(&self, device: &str) -> DevResult<()> {
+        if device.eq_ignore_ascii_case(&self.adm_name) {
+            return Err(DevFailed::new("API_NotSupported", "the admin device is not restarted", "DevRestart"));
+        }
+        let mut e = lock(self.entry(device)?);
+        let factory = self.classes.get(&e.class).ok_or_else(|| {
+            DevFailed::new("API_NotSupported", format!("no factory for class {}", e.class), "DevRestart")
+        })?;
+        let sink = EventSink { device: e.name.clone(), hub: self.hub.clone() };
+        e.restart(factory(), sink)
+    }
+
+    /// The lock of a device, if any and still valid.
+    fn holder(&self, device: &str) -> Option<DevLock> {
+        let mut locks = guard(&self.locks);
+        let device = device.to_lowercase();
+        if locks.get(&device).is_some_and(|l| l.until <= Instant::now()) {
+            locks.remove(&device);
+        }
+        locks.get(&device).cloned()
+    }
+
+    fn locked(device: &str, l: &DevLock) -> DevFailed {
+        let desc = format!("{device} is locked by client {} on {}", l.client, l.host);
+        DevFailed::new("API_DeviceLocked", desc, "Lock")
+    }
+
+    fn check_lock(&self, device: &str, client: u64) -> DevResult<()> {
+        match self.holder(device) {
+            Some(l) if l.client != client => Err(Self::locked(device, &l)),
+            _ => Ok(()),
+        }
+    }
+
+    fn lock_device(&self, device: &str, client: u64, host: &str, validity_s: i32) -> DevResult<()> {
+        if device.eq_ignore_ascii_case(&self.adm_name) {
+            return Err(DevFailed::new("API_DeviceUnlockable", "the admin device cannot be locked", "LockDevice"));
+        }
+        self.entry(device)?;
+        self.check_lock(device, client)?;
+        let validity = Duration::from_secs(validity_s.max(1) as u64);
+        let l = DevLock { client, host: host.into(), validity, until: Instant::now() + validity };
+        guard(&self.locks).insert(device.to_lowercase(), l);
+        Ok(())
+    }
+
+    fn relock(&self, device: &str, client: u64) -> DevResult<()> {
+        match self.holder(device) {
+            Some(l) if l.client == client => {
+                if let Some(l) = guard(&self.locks).get_mut(&device.to_lowercase()) {
+                    l.until = Instant::now() + l.validity;
+                }
+                Ok(())
+            }
+            Some(l) => Err(Self::locked(device, &l)),
+            None => Err(DevFailed::new("API_DeviceNotLocked", format!("{device} is not locked"), "ReLockDevices")),
+        }
+    }
+
+    /// Unlocks the devices locked by `client` (any client with `force`); returns how many.
+    fn unlock(&self, devices: &[String], client: u64, force: bool) -> DevResult<Value> {
+        let mut n = 0;
+        for device in devices {
+            match self.holder(device) {
+                Some(l) if l.client == client || force => {
+                    guard(&self.locks).remove(&device.to_lowercase());
+                    n += 1;
+                }
+                Some(l) => return Err(Self::locked(device, &l)),
+                None => {}
+            }
+        }
+        Ok(Value::Long(n))
+    }
+
+    /// `([locked, client, remaining ms], [status, host])`.
+    fn lock_status(&self, device: &str) -> DevResult<Value> {
+        self.entry(device)?;
+        Ok(match self.holder(device) {
+            Some(l) => {
+                let left = l.until.saturating_duration_since(Instant::now()).as_millis() as i32;
+                let status = format!("Device {device} is locked by client {} on {}", l.client, l.host);
+                Value::LongStringArray(vec![1, l.client as i32, left], vec![status, l.host])
+            }
+            None => {
+                Value::LongStringArray(vec![0, 0, 0], vec![format!("Device {device} is not locked"), String::new()])
+            }
+        })
     }
 }
 
@@ -865,6 +1335,11 @@ impl Server {
         let (stop, _) = watch::channel(false);
         let mut entries = HashMap::new();
         let mut exported = vec![];
+        let mut polling: Vec<_> = self
+            .polling
+            .into_iter()
+            .map(|(dev, obj, attr, period)| (dev, if attr { "attribute" } else { "command" }, obj, period, true))
+            .collect();
         for (name, dev) in devices.into_iter().chain([(adm_name.clone(), admin)]) {
             let mut entry = Entry::new(&name, dev);
             entry.store = store.clone();
@@ -880,36 +1355,51 @@ impl Server {
             let (class, props) = (entry.class.clone(), entry.property_names());
             let raw = store.properties(&name, &class, &props).await?;
             entry.init(raw);
+            // memorized set values are written back after the initialisation (RFC-4)
+            let memorized = entry.attrs.iter().filter(|a| a.memorized).filter_map(|a| {
+                let json = stored.get(&a.name.to_lowercase())?.get("__value")?.first()?;
+                Some((a.name.clone(), serde_json::from_str(json).ok()?))
+            });
+            let memorized = memorized.collect();
+            entry.restore(memorized);
+            // the polling configuration saved by AddObjPolling & co
+            let saved = ["polled_attr", "polled_cmd"].map(String::from);
+            let saved = store.properties(&name, &class, &saved).await?;
+            for (kind, prop) in [("attribute", "polled_attr"), ("command", "polled_cmd")] {
+                for pair in saved.get(prop).into_iter().flatten().collect::<Vec<_>>().chunks(2) {
+                    if let [obj, ms] = pair
+                        && let Ok(ms) = ms.parse::<u64>()
+                    {
+                        polling.push((name.clone(), kind, obj.to_string(), Duration::from_millis(ms.max(1)), false));
+                    }
+                }
+            }
             exported.push(name.clone());
             entries.insert(name.to_lowercase(), Arc::new(Mutex::new(entry)));
         }
-        for (dev, obj, is_attr, period) in self.polling {
-            let not_found = || DevFailed::new("API_DeviceNotFound", format!("{dev} not found"), "Server::poll");
-            let entry = entries.get(&dev).ok_or_else(not_found)?.clone();
-            let obj = {
-                let mut e = lock(&entry);
-                if is_attr {
-                    let name = e.attrs[find(&e.attrs, &obj, "API_AttrNotFound")?].name.clone();
-                    e.attr_ring.insert(name.clone(), VecDeque::new());
-                    name
-                } else {
-                    let name = e.cmds[find(&e.cmds, &obj, "API_CommandNotFound")?].name.clone();
-                    e.cmd_ring.insert(name.clone(), VecDeque::new());
-                    name
-                }
-            };
-            let mut stopped = stop.subscribe();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(period);
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => lock(&entry).poll(&obj),
-                        _ = stopped.wait_for(|s| *s) => break,
-                    }
-                }
-            });
+        let ctx = Ctx {
+            devices: entries,
+            adm_name: adm_name.clone(),
+            server_id: server,
+            host: endpoint_host(endpoint),
+            hub: hub.clone(),
+            stop,
+            store: store.clone(),
+            classes: self.classes,
+            rt: tokio::runtime::Handle::current(),
+            polls: Mutex::default(),
+            paused: Arc::default(),
+            locks: Mutex::default(),
+        };
+        for (dev, kind, obj, period, configured) in polling {
+            // a saved configuration may name what the code polls already, or what no longer exists
+            if let Err(e) = ctx.add_poll(&dev, kind, &obj, period, false)
+                && configured
+            {
+                return Err(e);
+            }
         }
-        let (beating, channel, mut stopped) = (hub.clone(), events::heartbeat_channel(&adm_name), stop.subscribe());
+        let (beating, channel, mut stopped) = (hub, events::heartbeat_channel(&adm_name), ctx.stop.subscribe());
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(beating.heartbeat);
             loop {
@@ -920,7 +1410,6 @@ impl Server {
             }
         });
 
-        let ctx = Ctx { devices: entries, adm_name, server_id: server, host: endpoint_host(endpoint), hub, stop };
         Ok(Started { handler: Handler(Arc::new(ctx)), store, devices: exported, shutdown })
     }
 }

@@ -17,6 +17,8 @@ pub struct TgTest {
     string: String,
     counter: i32,
     ramp: f64,
+    mode: i16,
+    dynamic: Vec<String>,
     blob: PipeBlob,
     events: Option<EventSink>,
 }
@@ -26,7 +28,7 @@ impl Default for TgTest {
         let elements =
             vec![("x".into(), Value::Double(1.0)), ("names".into(), Value::StringArray(vec!["a".into(), "b".into()]))];
         let blob = PipeBlob { name: "data".into(), elements };
-        Self { double: 0.0, string: String::new(), counter: 0, ramp: 0.0, blob, events: None }
+        Self { double: 0.0, string: String::new(), counter: 0, ramp: 0.0, mode: 0, dynamic: vec![], blob, events: None }
     }
 }
 
@@ -54,6 +56,9 @@ impl Device for TgTest {
             cmd("PushUser", T::Void, T::Void),
             cmd("PushDataReady", T::Long, T::Void),
             cmd("PushPipe", T::Void, T::Void),
+            cmd("AddDynamic", T::String, T::Void),
+            cmd("RemoveDynamic", T::String, T::Void),
+            cmd("LogMessage", T::String, T::Void),
             cmd("DevDouble", T::Double, T::Double),
             cmd("DevString", T::String, T::String),
             cmd("DevVarLongArray", T::LongArray, T::LongArray),
@@ -62,7 +67,7 @@ impl Device for TgTest {
         ]
     }
     fn attributes(&self) -> Vec<AttrInfo> {
-        vec![
+        let mut attrs = vec![
             AttrInfo {
                 min_value: Some(-100.0),
                 max_value: Some(100.0),
@@ -80,8 +85,18 @@ impl Device for TgTest {
                 archive_abs_change: Some(10.0),
                 ..attr("ramp", T::Double, F::Scalar, W::ReadWrite)
             },
+            AttrInfo {
+                writable_attr_name: "ramp".into(),
+                ..attr("ramp_target", T::Double, F::Scalar, W::ReadWithWrite)
+            },
+            AttrInfo {
+                enum_labels: ["OFF", "ON", "AUTO"].map(String::from).to_vec(),
+                ..attr("mode", T::Short, F::Scalar, W::ReadWrite)
+            },
             attr("faulty", T::Double, F::Scalar, W::Read),
-        ]
+        ];
+        attrs.extend(self.dynamic.iter().map(|n| attr(n, T::Double, F::Scalar, W::Read)));
+        attrs
     }
     fn pipes(&self) -> Vec<PipeInfo> {
         vec![
@@ -105,6 +120,21 @@ impl Device for TgTest {
                 sink().push_data_ready("ramp", n)?;
                 Ok(Value::Void)
             }
+            "AddDynamic" | "RemoveDynamic" => {
+                let Value::String(name) = arg else { unreachable!() };
+                if cmd == "AddDynamic" {
+                    self.dynamic.push(name);
+                } else {
+                    self.dynamic.retain(|n| *n != name);
+                }
+                sink().interface_changed();
+                Ok(Value::Void)
+            }
+            "LogMessage" => {
+                let Value::String(message) = arg else { unreachable!() };
+                sink().log(trust::LogLevel::Info, &message);
+                Ok(Value::Void)
+            }
             "PushPipe" => {
                 sink().push_pipe("blob", self.blob.clone())?;
                 Ok(Value::Void)
@@ -120,7 +150,9 @@ impl Device for TgTest {
     fn read_attribute(&mut self, attr: &str) -> DevResult<Value> {
         Ok(match attr {
             "double_scalar" => Value::Double(self.double),
-            "ramp" => Value::Double(self.ramp),
+            "ramp" | "ramp_target" => Value::Double(self.ramp),
+            "mode" => Value::Short(self.mode),
+            name if self.dynamic.iter().any(|d| d == name) => Value::Double(0.0),
             "long_spectrum" => Value::LongArray(vec![1, 2, 3]),
             "short_image" => Value::ShortArray(vec![1, 2, 3, 4]),
             "string_scalar" => Value::String(self.string.clone()),
@@ -137,6 +169,7 @@ impl Device for TgTest {
         match (attr, value) {
             ("double_scalar", Value::Double(v)) => self.double = v,
             ("ramp", Value::Double(v)) => self.ramp = v,
+            ("mode", Value::Short(v)) => self.mode = v,
             ("string_scalar", Value::String(v)) => self.string = v,
             _ => unreachable!("type checked by the server"),
         }
@@ -157,6 +190,7 @@ impl Device for TgTest {
 pub fn server() -> Server {
     Server::new("TgTest", "test")
         .device(DEV, TgTest::default())
+        .class("TgTest", || Box::new(TgTest::default()))
         .poll_attribute(DEV, "counter", POLL)
         .poll_attribute(DEV, "ramp", POLL)
         .heartbeat(HEARTBEAT)

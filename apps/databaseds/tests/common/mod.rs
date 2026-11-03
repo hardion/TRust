@@ -114,7 +114,13 @@ impl Device for Motor {
     }
     fn attributes(&self) -> Vec<AttrInfo> {
         vec![
-            AttrInfo { name: "position".into(), data_type: T::Double, writable: W::ReadWrite, ..Default::default() },
+            AttrInfo {
+                name: "position".into(),
+                data_type: T::Double,
+                writable: W::ReadWrite,
+                memorized: true,
+                ..Default::default()
+            },
             AttrInfo { name: "speed".into(), data_type: T::Double, ..Default::default() },
             AttrInfo { name: "port".into(), data_type: T::String, ..Default::default() },
         ]

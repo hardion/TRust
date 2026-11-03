@@ -55,6 +55,8 @@ macro_rules! data_types {
             $($o($ot), $oa(Vec<$ot>),)*
             LongStringArray(Vec<i32>, Vec<String>),
             DoubleStringArray(Vec<f64>, Vec<String>),
+            /// DevPipeBlob: a pipe element may itself be a blob (RFC-7).
+            PipeBlob(PipeBlob),
         }
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -65,6 +67,7 @@ macro_rules! data_types {
             $($o, $oa,)*
             LongStringArray,
             DoubleStringArray,
+            PipeBlob,
         }
 
         impl Value {
@@ -75,6 +78,7 @@ macro_rules! data_types {
                     $(Value::$o(_) => DataType::$o, Value::$oa(_) => DataType::$oa,)*
                     Value::LongStringArray(..) => DataType::LongStringArray,
                     Value::DoubleStringArray(..) => DataType::DoubleStringArray,
+                    Value::PipeBlob(_) => DataType::PipeBlob,
                 }
             }
 
@@ -273,6 +277,12 @@ pub struct AttrInfo {
     pub archive_period: Option<u64>,
     /// The device pushes CHANGE/ARCHIVE events itself: no polling or threshold needed.
     pub events_by_code: bool,
+    /// The set value is stored in the Database and written back at export (RFC-4).
+    pub memorized: bool,
+    /// Labels of a DevEnum attribute (a Short whose value indexes them).
+    pub enum_labels: Vec<String>,
+    /// For READ_WITH_WRITE: the writable attribute whose set value this one reports.
+    pub writable_attr_name: String,
 }
 
 impl AttrInfo {
