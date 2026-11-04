@@ -1,6 +1,8 @@
 //! UI tests (BROWSER.md §5): the browser run headless against a Database, a Demo device server
 //! and a Starter, driven and checked through the accessibility tree.
 
+#![cfg(not(target_arch = "wasm32"))]
+
 use eframe::egui::accesskit::Role;
 use eframe::egui::{Key, Modifiers};
 use egui_kittest::Harness;

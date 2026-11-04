@@ -17,6 +17,7 @@ jobs:
           - "--no-default-features --features zmq"
           - "--no-default-features --features grpc"
           - "--no-default-features --features zenoh"
+          - "--no-default-features --features ws"
           - "--features detect,zmq"
           - "--features full"
     steps:
@@ -75,3 +76,20 @@ jobs:
           key: browser
       - run: cargo clippy -p trust-browser --all-targets -- -D warnings
       - run: cargo test --no-fail-fast -p trust-browser
+
+  wasm:
+    name: WebAssembly (client library and browser)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+      - run: cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features ws -- -D warnings
+      - run: cargo clippy -p trust-browser --target wasm32-unknown-unknown --all-targets -- -D warnings
+      - run: cargo build -p trust-browser --bin trust-browser --release --target wasm32-unknown-unknown

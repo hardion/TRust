@@ -149,6 +149,7 @@ that every compiled transport is handled.
 | `grpc://` | gRPC | `host:port` |
 | `zenoh://<locator>` | Zenoh | `tcp/host:7447`; empty = multicast discovery |
 | `auto://` | wire detection | `host:port` |
+| `ws://` | WebSocket | `host:port` |
 
 A client URL is `<endpoint>/domain/family/member`; the device name is always
 the last three segments, so endpoints may contain `/`. A server can serve
@@ -173,6 +174,7 @@ first bytes of each connection (without consuming them) and dispatches:
 | `0xFF` | ZMTP greeting | spliced to an internal loopback ROUTER |
 | `PRI * HTTP/2.0` | HTTP/2 preface | the socket is handed to the tonic server (`serve_with_incoming`) |
 | `len len 0x?1` | Zenoh INIT message after its `u16` length | spliced to an internal loopback Zenoh listener |
+| `GET` | WebSocket handshake | the WebSocket transport (`ws` feature) |
 | anything else | unknown | closed |
 
 Every signature is positive; nothing is matched as "whatever is left". An
@@ -207,7 +209,27 @@ Limits of detection:
   **ALPN** protocol (`h2`, `zmtp`, `tango-json`, …). That is the standard
   way to share a TLS port.
 
-### 3.4 Next steps
+### 3.4 WebSocket and web pages
+
+A web page cannot open a TCP connection: WebSocket is its only socket. The
+`ws` feature therefore adds a fifth transport, with the TCP framing (one JSON
+frame per text message, and an event connection whose first message is
+`{"subscribe": [...]}`):
+
+* **Server:** `ws://host:port`, and a WebSocket handshake (an HTTP `GET`) is
+  also accepted on every `tcp://` and `auto://` port. A server built with
+  `ws` is reachable from a web page without a new endpoint, and so is the
+  Database on `TANGO_HOST`.
+* **Client:** tokio-tungstenite natively (`ws://` URLs; the validation and
+  event suites run over `ws://`, over a `tcp://` port and over an `auto://`
+  port), the browser's `WebSocket` on `wasm32`. There, the library compiles
+  its client side only, with `trust::rt` for timers and background tasks
+  (tokio natively, the page's event loop and `setTimeout` on wasm32), and
+  `tcp://`/`auto://` endpoints from the Database are reached as `ws://`.
+* **Limit:** ZeroMQ, gRPC and Zenoh endpoints are out of reach of a web page
+  (gRPC-Web or Zenoh's WebSocket transport would be the way there).
+
+### 3.5 Next steps
 
 * **Codec as a second axis.** JSON is used by every transport today, but
   the same seam takes a binary codec (CBOR or MessagePack) with no other

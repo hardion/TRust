@@ -9,11 +9,26 @@ use eframe::egui::{self, Color32, RichText, Ui};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Mutex;
+use trust::rt::{AbortHandle, Instant};
 use trust::*;
 
+/// `Send` natively, where background calls run on a thread pool; nothing in a web page, where
+/// everything runs on its one thread (and a browser WebSocket is not `Send`).
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MaybeSend: Send {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send> MaybeSend for T {}
+#[cfg(target_arch = "wasm32")]
+pub trait MaybeSend {}
+#[cfg(target_arch = "wasm32")]
+impl<T> MaybeSend for T {}
+
+#[cfg(not(target_arch = "wasm32"))]
 type Update = Box<dyn FnOnce(&mut Browser) + Send>;
+#[cfg(target_arch = "wasm32")]
+type Update = Box<dyn FnOnce(&mut Browser)>;
 type Proxy = Arc<Mutex<DeviceProxy>>;
 
 /// Sends updates to the UI and wakes it up.
@@ -24,7 +39,7 @@ struct Notifier {
 }
 
 impl Notifier {
-    fn send(&self, update: impl FnOnce(&mut Browser) + Send + 'static) {
+    fn send(&self, update: impl FnOnce(&mut Browser) + MaybeSend + 'static) {
         let _ = self.tx.send(Box::new(update));
         if let Some(ctx) = self.ctx.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
             ctx.request_repaint();
@@ -38,6 +53,8 @@ const REFRESH: Duration = Duration::from_secs(1);
 const TREND_DEPTH: usize = 1000;
 
 pub struct Browser {
+    /// The background calls' runtime (in a web page, the browser's event loop).
+    #[cfg(not(target_arch = "wasm32"))]
     rt: tokio::runtime::Runtime,
     notifier: Notifier,
     rx: mpsc::Receiver<Update>,
@@ -71,11 +88,11 @@ enum Tab {
 
 /// Aborts the background tasks of a panel when it closes.
 #[derive(Default)]
-struct Tasks(Vec<tokio::task::AbortHandle>);
+struct Tasks(Vec<AbortHandle>);
 
 impl Drop for Tasks {
     fn drop(&mut self) {
-        self.0.iter().for_each(tokio::task::AbortHandle::abort);
+        self.0.iter().for_each(AbortHandle::abort);
     }
 }
 
@@ -211,10 +228,12 @@ fn err(e: DevFailed) -> String {
 impl Browser {
     /// A browser on the Database at `tango_host` (`None`: direct URLs only).
     pub fn new(tango_host: Option<String>) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("a runtime");
         let (tx, rx) = mpsc::channel();
         let notifier = Notifier { tx, ctx: Arc::default() };
         Self {
+            #[cfg(not(target_arch = "wasm32"))]
             rt,
             notifier,
             rx,
@@ -232,13 +251,20 @@ impl Browser {
     }
 
     /// Runs `f` in the background; its result updates the UI.
-    fn spawn<F, U>(&self, f: F) -> tokio::task::AbortHandle
+    fn spawn<F, U>(&self, f: F) -> AbortHandle
     where
-        F: Future<Output = Box<U>> + Send + 'static,
-        U: FnOnce(&mut Browser) + Send + 'static,
+        F: Future<Output = Box<U>> + MaybeSend + 'static,
+        U: FnOnce(&mut Browser) + MaybeSend + 'static,
     {
         let notifier = self.notifier.clone();
-        self.rt.spawn(async move { notifier.send(*f.await) }).abort_handle()
+        self.background(async move { notifier.send(*f.await) })
+    }
+
+    /// Runs `f` in the background, on the app's runtime (the browser's event loop in a web page).
+    fn background(&self, f: impl Future<Output = ()> + MaybeSend + 'static) -> AbortHandle {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _runtime = self.rt.enter();
+        trust::rt::spawn(f)
     }
 
     fn report(&mut self, message: String) {
@@ -291,7 +317,7 @@ impl Browser {
                             _ => Err(DevFailed::new("API_BadReply", "HostState", "Starter")),
                         }
                     };
-                    let state = tokio::time::timeout(Duration::from_secs(2), state).await.ok().and_then(Result::ok);
+                    let state = trust::rt::timeout(Duration::from_secs(2), state).await.and_then(Result::ok);
                     states.push((h, state));
                 }
                 Ok::<_, DevFailed>((devices, exported, aliases, states))
@@ -384,9 +410,9 @@ impl Browser {
         let (url, name, attrs) =
             (d.url.clone(), d.name.clone(), d.attrs.iter().map(|a| a.name.clone()).collect::<Vec<_>>());
         let notifier = self.notifier.clone();
-        let task = self.rt.spawn(async move {
+        let task = self.background(async move {
             let Ok(mut events) = DeviceProxy::connect(&url).await else { return };
-            let mut streams = tokio::task::JoinSet::new();
+            let mut streams = vec![];
             for attr in attrs {
                 let Ok(mut stream) = events.event_stream(&attr, EventType::Change).await else { continue };
                 let (notifier, name) = (notifier.clone(), name.clone());
@@ -400,7 +426,7 @@ impl Browser {
                         }
                     }
                 });
-                streams.spawn(async move {
+                streams.push(async move {
                     while let Some(e) = stream.recv().await {
                         let value = match e.data {
                             Ok(EventData::Attr(v)) => Ok(v),
@@ -418,10 +444,10 @@ impl Browser {
                     }
                 });
             }
-            while streams.join_next().await.is_some() {}
+            futures_util::future::join_all(streams).await;
         });
         if let View::Device(d) = &mut self.view {
-            d.tasks.0.push(task.abort_handle());
+            d.tasks.0.push(task);
         }
     }
 
@@ -468,8 +494,8 @@ impl Browser {
     /// Runs `call` on the device proxy, then stores its result under `key`.
     fn device_call<F, Fut>(&mut self, key: String, call: F)
     where
-        F: FnOnce(Proxy) -> Fut + Send + 'static,
-        Fut: Future<Output = DevResult<String>> + Send,
+        F: FnOnce(Proxy) -> Fut + MaybeSend + 'static,
+        Fut: Future<Output = DevResult<String>> + MaybeSend,
     {
         let View::Device(d) = &mut self.view else { return };
         let Some(proxy) = d.proxy.clone() else { return };
@@ -495,7 +521,7 @@ impl Browser {
     /// as text under `key` of the current panel.
     fn remote<F>(&mut self, url: String, key: String, then: F, cmd: &'static str, arg: Value)
     where
-        F: FnOnce(&mut Browser, &Value) + Send + 'static,
+        F: FnOnce(&mut Browser, &Value) + MaybeSend + 'static,
     {
         self.spawn(async move {
             let result = async { DeviceProxy::connect(&url).await?.command_inout(cmd, arg).await }.await;
@@ -598,7 +624,7 @@ impl Browser {
         }));
         let host = host.to_string();
         let notifier = self.notifier.clone();
-        let task = self.rt.spawn(async move {
+        let task = self.background(async move {
             let proxy = async {
                 let mut p = DeviceProxy::connect(&url).await?;
                 p.ping().await?;
@@ -655,7 +681,7 @@ impl Browser {
             }
         });
         if let View::Host(h) = &mut self.view {
-            h.tasks.0.push(task.abort_handle());
+            h.tasks.0.push(task);
         }
     }
 

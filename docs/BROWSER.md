@@ -1,14 +1,21 @@
 # TRust Browser — device browser and Starter interface
 
-`trust-browser` (`apps/browser`) is a native desktop application written in
-Rust with **egui / eframe**. It talks to a control system only through
-`DeviceProxy`, so it works over every transport. (A WebAssembly build would
-need a browser-side transport: not done.)
+`trust-browser` (`apps/browser`) is written in Rust with **egui / eframe**:
+a native desktop application, and the same code in a web page (WebAssembly).
+It talks to a control system only through `DeviceProxy`, so it works over
+every transport natively, and over WebSocket in a web page.
 
 ```sh
 cargo run -p trust-browser -- localhost:10000        # or $TANGO_HOST
 cargo run -p trust-browser --bin DemoServer -- <instance>   # the Demo devices registered for DemoServer/<instance>
+apps/browser/web/build.sh                                    # the web page into apps/browser/web/pkg
+python3 -m http.server -d apps/browser/web 8080              # then open http://localhost:8080/?db=<TANGO_HOST>
 ```
+
+In a web page the browser reaches the Database and the devices over
+WebSocket, which servers built with the `ws` feature accept on their
+`tcp://` and `auto://` ports (TRANSPORTS.md §3.4); devices served only on
+ZeroMQ, gRPC or Zenoh are out of reach there.
 Every form is **inferred from the device's interface** (`CmdInfo`, `AttrInfo`,
 `PipeInfo`, `PropInfo`), so no device class needs GUI code.
 
@@ -128,9 +135,8 @@ Implemented as above, with these differences:
 * Writable pipes are edited as JSON (the blob read last is the template).
 * Text is plain ASCII/Latin (state and quality lights are drawn shapes), so
   any font renders it and the headless tests need no extra font.
-* Not done: a WebAssembly build. A browser page cannot open TCP connections
-  and the client library runs on tokio's network stack, so it needs a
-  WebSocket transport (server and `wasm32` client) first.
+* The web build (wasm32) runs the same app over WebSocket; `?db=host:port`
+  picks the Database (default: the page's host, port 10000).
 
 Tests: `form.rs` unit tests (widgets, texts, parsing with range errors, round
 trips, heat maps), `app.rs` unit tests (tree filter, Starter lines, property
