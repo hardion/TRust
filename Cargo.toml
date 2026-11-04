@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "apps/databaseds", "apps/starter"]
+members = [".", "apps/databaseds", "apps/starter", "apps/browser"]
 
 [package]
 name = "trust"

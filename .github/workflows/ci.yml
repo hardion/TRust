@@ -60,3 +60,18 @@ jobs:
           key: starter
       - run: cargo clippy -p trust-starter --all-targets -- -D warnings
       - run: cargo test --no-fail-fast -p trust-starter
+
+  browser:
+    name: Browser (egui, headless UI tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: browser
+      - run: cargo clippy -p trust-browser --all-targets -- -D warnings
+      - run: cargo test --no-fail-fast -p trust-browser
