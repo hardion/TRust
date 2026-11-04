@@ -114,23 +114,32 @@ type, so the rules below can be unit-tested without a GUI:
   execute a command, start and stop a server from the host panel. They
   assert on the accessibility tree, not on pixels.
 
-## 6. Status (M5)
+## 6. Status
 
 Implemented as above, with these differences:
 
 * Values without CHANGE events refresh every second (fixed period).
-* Spectrum attributes are plotted inline; the trend plot of a scalar on click,
-  the IMAGE heat map (dimensions only for now), aliases in the tree and the
-  property history are not done yet.
+* Clicking a numeric scalar attribute opens its trend (the last 1000 values,
+  from events or polling); clicking again closes it.
+* IMAGE attributes show as a greyscale heat map (smallest value black,
+  largest white).
+* Aliases are a section of the tree; properties have a *History* window
+  (`DbGetDevicePropertyHist`).
 * Writable pipes are edited as JSON (the blob read last is the template).
 * Text is plain ASCII/Latin (state and quality lights are drawn shapes), so
   any font renders it and the headless tests need no extra font.
+* Not done: a WebAssembly build. A browser page cannot open TCP connections
+  and the client library runs on tokio's network stack, so it needs a
+  WebSocket transport (server and `wasm32` client) first.
 
 Tests: `form.rs` unit tests (widgets, texts, parsing with range errors, round
-trips), `app.rs` unit tests (tree filter, Starter lines), and two
-`egui_kittest` tests in `tests/ui.rs` against a live Database, a `DemoServer`
-and a Starter: open a device from the tree, read and write attributes
-(including the alarm-limit confirmation and a `max_value` refusal), run a
-command, read a pipe and the properties, show the black box; start, stop and
-read the log of a server from the host panel, list its devices, register a
-new server.
+trips, heat maps), `app.rs` unit tests (tree filter, Starter lines, property
+history), and two `egui_kittest` tests in `tests/ui.rs` against a live
+Database, a `DemoServer` and a Starter:
+
+* device: open it from an alias and from the tree; read and write attributes
+  (including the alarm-limit confirmation and a `max_value` refusal); see an
+  image heat map; open a trend, watch it grow, close it; run a command; read a
+  pipe, the properties and a property history; show the black box;
+* Starter: start, stop and read the log of a server from the host panel, list
+  its devices, register a new server.
