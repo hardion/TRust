@@ -63,6 +63,12 @@ impl Device for Demo {
             },
             AttrInfo { data_format: DataFormat::Spectrum, max_dim_x: 16, ..attr("wave", T::Double, Writable::Read) },
             attr("label", T::String, Writable::Read),
+            AttrInfo {
+                data_format: DataFormat::Image,
+                max_dim_x: 4,
+                max_dim_y: 3,
+                ..attr("frame", T::Short, Writable::Read)
+            },
         ]
     }
     fn pipes(&self) -> Vec<PipeInfo> {
@@ -83,6 +89,7 @@ impl Device for Demo {
             "position" => Value::Double(self.position),
             "mode" => Value::Short(self.mode),
             "wave" => Value::DoubleArray((0..16).map(|i| (i as f64 / 2.5).sin()).collect()),
+            "frame" => Value::ShortArray((0..12).collect()),
             _ => Value::String(self.label.clone()),
         })
     }

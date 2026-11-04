@@ -34,6 +34,8 @@ impl Notifier {
 
 /// Values refresh this often when they have no CHANGE events.
 const REFRESH: Duration = Duration::from_secs(1);
+/// Points kept per trend.
+const TREND_DEPTH: usize = 1000;
 
 pub struct Browser {
     rt: tokio::runtime::Runtime,
@@ -44,6 +46,8 @@ pub struct Browser {
     url: String,
     devices: Vec<String>,
     exported: HashSet<String>,
+    /// `(alias, device)`.
+    aliases: Vec<(String, String)>,
     hosts: Vec<(String, Option<i16>)>,
     view: View,
     log: Vec<String>,
@@ -107,7 +111,34 @@ struct DevicePanel {
     confirm: Option<(String, Value)>,
     refreshed: Option<Instant>,
     busy: bool,
+    /// `[time, value]` of the numeric scalar attributes, oldest first.
+    trends: HashMap<String, std::collections::VecDeque<[f64; 2]>>,
+    /// The attributes whose trend window is open.
+    trending: HashSet<String>,
+    /// Heat maps of the IMAGE attributes, with the time of the value they show.
+    images: HashMap<String, (f64, egui::TextureHandle)>,
+    /// The property whose history is shown, and its changes.
+    history: Option<(String, Vec<String>)>,
     tasks: Tasks,
+}
+
+impl DevicePanel {
+    /// Stores a value, and adds numeric scalars to their trend.
+    fn record(&mut self, attr: String, value: Result<AttrValue, String>) {
+        if let Ok(v) = &value
+            && let [x] = v.value.numbers()[..]
+            && self.attrs.iter().any(|a| a.name == attr && a.data_format == DataFormat::Scalar)
+        {
+            let trend = self.trends.entry(attr.clone()).or_default();
+            if trend.back().is_none_or(|p| p[0] < v.time) {
+                trend.push_back([v.time, x]);
+            }
+            if trend.len() > TREND_DEPTH {
+                trend.pop_front();
+            }
+        }
+        self.values.insert(attr, value);
+    }
 }
 
 /// One line of the Starter's `Servers` attribute.
@@ -192,6 +223,7 @@ impl Browser {
             url: String::new(),
             devices: vec![],
             exported: HashSet::new(),
+            aliases: vec![],
             hosts: vec![],
             view: View::Empty,
             log: vec![],
@@ -241,6 +273,14 @@ impl Browser {
                     list("DbGetDeviceExportedList").await?,
                     list("DbGetHostList").await?,
                 );
+                let mut aliases = vec![];
+                for alias in list("DbGetDeviceAliasList").await? {
+                    if let Ok(Value::String(device)) =
+                        db.command("DbGetAliasDevice", Value::String(alias.clone())).await
+                    {
+                        aliases.push((alias, device));
+                    }
+                }
                 let mut states = vec![];
                 for h in hosts {
                     let url = format!("tango://{host}/tango/admin/{}", h.to_lowercase());
@@ -254,12 +294,13 @@ impl Browser {
                     let state = tokio::time::timeout(Duration::from_secs(2), state).await.ok().and_then(Result::ok);
                     states.push((h, state));
                 }
-                Ok::<_, DevFailed>((devices, exported, states))
+                Ok::<_, DevFailed>((devices, exported, aliases, states))
             }
             .await;
             Box::new(move |b: &mut Browser| match result {
-                Ok((devices, exported, hosts)) => {
+                Ok((devices, exported, aliases, hosts)) => {
                     b.devices = devices;
+                    b.aliases = aliases;
                     b.exported = exported.into_iter().map(|d| d.to_lowercase()).collect();
                     b.hosts = hosts;
                 }
@@ -298,6 +339,10 @@ impl Browser {
             confirm: None,
             refreshed: None,
             busy: true,
+            trends: HashMap::new(),
+            trending: HashSet::new(),
+            images: HashMap::new(),
+            history: None,
             tasks: Tasks::default(),
         };
         self.view = View::Device(Box::new(panel));
@@ -367,7 +412,7 @@ impl Browser {
                             if let View::Device(d) = &mut b.view
                                 && d.name == name
                             {
-                                d.values.insert(attr, value);
+                                d.record(attr, value);
                             }
                         });
                     }
@@ -411,7 +456,7 @@ impl Browser {
                 match values {
                     Ok(values) => {
                         for (n, v) in names.into_iter().zip(values) {
-                            d.values.insert(n, v.map_err(err));
+                            d.record(n, v.map_err(err));
                         }
                     }
                     Err(e) => d.error = Some(err(e)),
@@ -749,6 +794,20 @@ impl Browser {
                     }
                 });
             }
+            let aliases: Vec<_> = self
+                .aliases
+                .iter()
+                .filter(|(a, d)| self.filter.is_empty() || matches(&self.filter, a) || matches(&self.filter, d))
+                .collect();
+            if !aliases.is_empty() {
+                egui::CollapsingHeader::new("Aliases").default_open(filtering).show(ui, |ui| {
+                    for (alias, device) in aliases {
+                        if ui.selectable_label(false, alias).on_hover_text(device).clicked() {
+                            open = Some(device.clone());
+                        }
+                    }
+                });
+            }
             ui.separator();
             ui.heading("Hosts");
             let mut host = None;
@@ -824,11 +883,42 @@ impl Browser {
             ui.end_row();
             for a in &d.attrs {
                 let tip = format!("{}\n{}", a.label, a.description);
-                ui.label(&a.name).on_hover_text(tip);
+                let numeric = a.data_format == DataFormat::Scalar
+                    && d.values.get(&a.name).is_some_and(|v| v.as_ref().is_ok_and(|v| v.value.numbers().len() == 1));
+                if numeric {
+                    let shown = d.trending.contains(&a.name);
+                    if ui.selectable_label(shown, &a.name).on_hover_text(format!("{tip}\n(click: trend)")).clicked() {
+                        if shown {
+                            d.trending.remove(&a.name);
+                        } else {
+                            d.trending.insert(a.name.clone());
+                        }
+                    }
+                } else {
+                    ui.label(&a.name).on_hover_text(tip);
+                }
                 let value = d.values.get(&a.name);
                 match value {
                     Some(Ok(v)) if a.data_format == DataFormat::Image => {
-                        ui.label(format!("{}x{} image", v.dim_x, v.dim_y));
+                        let fresh = d.images.get(&a.name).is_some_and(|(t, _)| *t == v.time);
+                        if !fresh {
+                            let image = form::heat_map(&v.value.numbers(), v.dim_x);
+                            let texture = ui.ctx().load_texture(
+                                format!("heat map {}", a.name),
+                                image,
+                                egui::TextureOptions::NEAREST,
+                            );
+                            d.images.insert(a.name.clone(), (v.time, texture));
+                        }
+                        ui.vertical(|ui| {
+                            ui.label(format!("{}x{} image", v.dim_x, v.dim_y));
+                            if let Some((_, texture)) = d.images.get(&a.name) {
+                                let scale = (160.0 / v.dim_x.max(1) as f32).min(16.0);
+                                let size = egui::vec2(v.dim_x as f32, v.dim_y.max(1) as f32) * scale;
+                                ui.add(egui::Image::new(texture).fit_to_exact_size(size))
+                                    .accessible_name(format!("{} heat map", a.name));
+                            }
+                        });
                     }
                     Some(Ok(v)) => {
                         let text = form::display(&v.value, &a.format, &a.unit, &a.enum_labels);
@@ -898,6 +988,41 @@ impl Browser {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         let View::Device(d) = &mut self.view else { return };
+        let now = trust::now();
+        let mut closed = vec![];
+        for attr in &d.trending {
+            let mut open = true;
+            let points = d.trends.get(attr).map(|t| t.iter().map(|[t, y]| [t - now, *y]).collect::<Vec<_>>());
+            egui::Window::new(format!("Trend of {attr}")).open(&mut open).default_size([420.0, 240.0]).show(
+                ctx,
+                |ui| {
+                    let points = points.unwrap_or_default();
+                    ui.label(format!("{} points, seconds from now", points.len()));
+                    egui_plot::Plot::new(("trend", attr)).height(180.0).show(ui, |p| {
+                        p.line(egui_plot::Line::new(attr.as_str(), egui_plot::PlotPoints::from(points)));
+                    });
+                },
+            );
+            if !open {
+                closed.push(attr.clone());
+            }
+        }
+        for attr in closed {
+            d.trending.remove(&attr);
+        }
+        let mut close_history = false;
+        if let Some((prop, changes)) = &d.history {
+            let mut open = true;
+            egui::Window::new(format!("History of {prop}")).open(&mut open).show(ctx, |ui| {
+                for c in changes {
+                    ui.monospace(c);
+                }
+            });
+            close_history = !open;
+        }
+        if close_history {
+            d.history = None;
+        }
         let mut apply = None;
         if let Some(c) = &mut d.config {
             let mut open = true;
@@ -1073,6 +1198,7 @@ impl Browser {
         let Some(db) = self.tango_host.as_ref().map(|h| format!("tango://{h}/{DATABASE_DEVICE}")) else { return };
         let mut put = None;
         let mut delete = None;
+        let mut history = None;
         egui::Grid::new("properties").striped(true).show(ui, |ui| {
             let mut names: Vec<String> = d.props.keys().cloned().collect();
             names.extend(d.wizard.keys().filter(|n| !d.props.keys().any(|p| p.eq_ignore_ascii_case(n))).cloned());
@@ -1088,6 +1214,9 @@ impl Browser {
                 }
                 if set && ui.button("Delete").clicked() {
                     delete = Some(name.clone());
+                }
+                if set && ui.button("History").clicked() {
+                    history = Some(name.clone());
                 }
                 if !set {
                     d.props.remove(&name);
@@ -1110,6 +1239,14 @@ impl Browser {
         } else if let Some(prop) = delete {
             let arg = vec![name, prop.clone()];
             self.remote(db, format!("property {prop}"), reload, "DbDeleteDeviceProperty", Value::StringArray(arg));
+        } else if let Some(prop) = history {
+            let arg = Value::StringArray(vec![name, prop.clone()]);
+            let then = move |b: &mut Browser, v: &Value| {
+                if let (View::Device(d), Value::StringArray(l)) = (&mut b.view, v) {
+                    d.history = Some((prop, history_lines(l)));
+                }
+            };
+            self.remote(db, "history".into(), then, "DbGetDevicePropertyHist", arg);
         }
     }
 
@@ -1369,6 +1506,20 @@ impl Browser {
     }
 }
 
+/// `DbGet*PropertyHist` (`[name, date, count, values...]` per change) as one line per change,
+/// oldest first.
+fn history_lines(l: &[String]) -> Vec<String> {
+    let (mut out, mut at) = (vec![], 0);
+    while at + 2 < l.len() {
+        let n: usize = l[at + 2].parse().unwrap_or(0);
+        let values = &l[(at + 3).min(l.len())..(at + 3 + n).min(l.len())];
+        let text = if n == 0 { "(deleted)".to_string() } else { values.join(", ") };
+        out.push(format!("{}  {text}", l[at + 1]));
+        at += 3 + n;
+    }
+    out
+}
+
 /// A coloured status light.
 fn dot(ui: &mut Ui, colour: Color32) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
@@ -1490,6 +1641,12 @@ mod tests {
     fn device_names() {
         assert_eq!(device_of("grpc://host:50051/sys/tg/1"), "sys/tg/1");
         assert_eq!(device_of("tango://host:10000/sys/tg/1#dbase=no"), "sys/tg/1");
+    }
+
+    #[test]
+    fn history() {
+        let l = ["Label", "2026-01-01 10:00:00", "1", "first", "Label", "2026-01-02 10:00:00", "0"].map(String::from);
+        assert_eq!(history_lines(&l), ["2026-01-01 10:00:00  first", "2026-01-02 10:00:00  (deleted)"]);
     }
 
     #[test]

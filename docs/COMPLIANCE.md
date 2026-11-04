@@ -116,6 +116,6 @@ of `docs/PLAN.md` §Phase 2), ⛔ out of scope (with reason).
 | Item | Status |
 |---|---|
 | Starter device (`tango/admin/<host>`) | ✅ `apps/starter` (Unix-first: SIGKILL, `TANGO_HOST` for children) |
-| Device browser GUI with generic forms (egui) | ✅ `apps/browser` (see BROWSER.md §6 for what is left) |
+| Device browser GUI with generic forms (egui) | ✅ `apps/browser` (WebAssembly build ⛔ until a WebSocket transport exists, BROWSER.md §6) |
 | Starter interface in the browser (Astor-like) | ✅ |
 | Access control (RFC-18), memorised attribute service (RFC-17), cache system (RFC-16) | ⛔ later phase |

@@ -229,6 +229,21 @@ pub fn parse(t: DataType, text: &str, min: Option<f64>, max: Option<f64>) -> Res
     })
 }
 
+/// An IMAGE attribute as a greyscale heat map, `width` pixels wide: the smallest value is black,
+/// the largest white.
+pub fn heat_map(values: &[f64], width: usize) -> eframe::egui::ColorImage {
+    let width = width.max(1);
+    let height = values.len().div_ceil(width).max(1);
+    let (lo, hi) = values.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| (lo.min(*x), hi.max(*x)));
+    let span = if hi > lo { hi - lo } else { 1.0 };
+    let mut pixels = vec![Color32::BLACK; width * height];
+    for (p, x) in pixels.iter_mut().zip(values) {
+        let g = ((x - lo) / span * 255.0).round() as u8;
+        *p = Color32::from_gray(g);
+    }
+    eframe::egui::ColorImage::new([width, height], pixels)
+}
+
 /// Tango colours of the states.
 pub fn state_color(s: DevState) -> Color32 {
     match s {
@@ -342,6 +357,17 @@ mod tests {
         for v in values {
             assert_eq!(parse(v.data_type(), &edit_text(&v), None, None), Ok(v.clone()), "{v:?}");
         }
+    }
+
+    #[test]
+    fn heat_maps() {
+        let image = heat_map(&[0.0, 5.0, 10.0, 10.0, 0.0, 5.0], 3);
+        assert_eq!(image.size, [3, 2]);
+        assert_eq!(image.pixels[0], Color32::from_gray(0), "smallest: black");
+        assert_eq!(image.pixels[2], Color32::from_gray(255), "largest: white");
+        assert_eq!(image.pixels[1], Color32::from_gray(128));
+        assert_eq!(heat_map(&[7.0, 7.0], 2).pixels[0], Color32::from_gray(0), "a flat image");
+        assert_eq!(heat_map(&[], 0).size, [1, 1]);
     }
 
     #[test]

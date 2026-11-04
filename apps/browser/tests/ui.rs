@@ -4,7 +4,7 @@
 use eframe::egui::accesskit::Role;
 use eframe::egui::{Key, Modifiers};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use std::path::PathBuf;
 use std::time::Duration;
 use trust::{DeviceProxy, Value};
@@ -65,9 +65,10 @@ fn wait(h: &mut Harness<'_, Browser>, label: &str) {
     panic!("no {label:?} in the UI");
 }
 
+/// Clicks the widget named `label` through the accessibility tree (where a window may cover it).
 fn click(h: &mut Harness<'_, Browser>, label: &str) {
     wait(h, label);
-    h.get_by_label(label).click();
+    h.get_by_label(label).click_accesskit();
     h.step();
 }
 
@@ -97,7 +98,10 @@ fn browse_and_operate_a_device() {
         let host = start_db("device").await;
         let mut db = DeviceProxy::connect(&format!("tango://{host}/sys/database/2#dbase=no")).await.unwrap();
         db.command_inout("DbAddDevice", sa(&["DemoServer/ui", "lab/demo/m1", "Demo"])).await.unwrap();
-        db.command_inout("DbPutDeviceProperty", sa(&["lab/demo/m1", "1", "Label", "1", "hello"])).await.unwrap();
+        for label in ["first", "hello"] {
+            db.command_inout("DbPutDeviceProperty", sa(&["lab/demo/m1", "1", "Label", "1", label])).await.unwrap();
+        }
+        db.command_inout("DbPutDeviceAlias", sa(&["lab/demo/m1", "mymotor"])).await.unwrap();
         let args = ["ui", &format!("-dbhost={host}"), "-endpoint=auto://127.0.0.1:0"].map(String::from).to_vec();
         tokio::spawn(trust_browser::demo::server(args).unwrap().run_args());
         wait_device(&host, "lab/demo/m1").await;
@@ -105,13 +109,17 @@ fn browse_and_operate_a_device() {
     });
     let mut h = harness(Browser::new(Some(host)));
 
-    // the Database tree: domain, family, member
+    // a device from its alias, then from the tree: domain, family, member
+    click(&mut h, "Aliases");
+    click(&mut h, "mymotor");
+    wait(&mut h, "[Demo]");
     click(&mut h, "lab");
     click(&mut h, "demo");
     click(&mut h, "m1");
-    wait(&mut h, "[Demo]");
     wait(&mut h, "0.00 mm");
     wait(&mut h, "hello");
+    wait(&mut h, "4x3 image");
+    wait(&mut h, "frame heat map");
 
     // writes: a plain one, one past the alarm limit (confirmed), one past max_value (refused)
     enter(&mut h, "write position", "12.5");
@@ -121,6 +129,29 @@ fn browse_and_operate_a_device() {
     wait(&mut h, "60.00 mm");
     enter(&mut h, "write position", "101");
     wait(&mut h, "101 is outside [-inf, 100]");
+
+    // the trend of a numeric scalar, which keeps filling
+    click(&mut h, "position");
+    wait(&mut h, "Trend of position");
+    let points = |h: &Harness<'_, Browser>| {
+        let node = h.get_by_label_contains("points, seconds from now");
+        let label = node.accesskit_node().label().or_else(|| node.value()).unwrap_or_default();
+        label.split(' ').next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0)
+    };
+    let before = points(&h);
+    for _ in 0..200 {
+        h.step();
+        if points(&h) > before {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(points(&h) > before, "the trend grows");
+    click(&mut h, "position");
+    for _ in 0..40 {
+        h.step();
+    }
+    assert!(h.query_by_label_contains("Trend of position").is_none(), "a second click closes the trend");
 
     click(&mut h, "Commands");
     enter(&mut h, "argument of Twice", "21");
@@ -140,6 +171,9 @@ fn browse_and_operate_a_device() {
         std::thread::sleep(Duration::from_millis(25));
     }
     assert_eq!(h.get_by_label("property Label").value().as_deref(), Some("hello"));
+    click(&mut h, "History");
+    wait(&mut h, "History of Label");
+    wait(&mut h, "  first");
 
     click(&mut h, "Admin");
     click(&mut h, "Black box");
