@@ -24,8 +24,17 @@ struct Subscribe {
 }
 
 /// Serves one accepted connection until it closes or the server stops: requests, or the events
-/// of the channels its first line subscribes to.
+/// of the channels its first line subscribes to. With the `ws` feature, a connection starting
+/// with an HTTP `GET` is served as a WebSocket.
 pub(crate) async fn serve_stream(stream: TcpStream, handler: Handler) {
+    // a WebSocket handshake (a web page cannot open a plain TCP connection)
+    #[cfg(feature = "ws")]
+    {
+        let mut head = [0; 4];
+        if matches!(stream.peek(&mut head).await, Ok(4)) && &head == b"GET " {
+            return super::ws::serve_stream(stream, handler).await;
+        }
+    }
     let peer = stream.peer_addr().map_or_else(|_| "tcp".into(), |a| a.to_string());
     let _ = stream.set_nodelay(true);
     let (r, mut w) = stream.into_split();

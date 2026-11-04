@@ -68,6 +68,8 @@ pub struct Database(Arc<Mutex<DeviceProxy>>);
 
 impl Database {
     /// `tango_host` is `host:port` (transport detected) or a URL such as `grpc://host:10000`.
+    // a web page has one thread: the proxy (a browser WebSocket) needs not be Send
+    #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
     pub async fn connect(tango_host: &str) -> DevResult<Self> {
         let proxy = DeviceProxy::direct(&database_endpoint(tango_host), DATABASE_DEVICE).await?;
         Ok(Self(Arc::new(Mutex::new(proxy))))

@@ -32,6 +32,7 @@ comparison and the design live in [`TRANSPORTS.md`](TRANSPORTS.md).
 | `grpc://` | gRPC | `grpc` | unary `tango.v1.Device/Call` (`proto/tango.proto`), protobuf envelope, JSON `op`/`reply` |
 | `zenoh://<locator>` | Zenoh | `zenoh` | queryable `tango/<device in lower case>`, frame = query payload |
 | `auto://` | wire detection | `detect` | server: one port for every compiled TCP-based wire; client: probe |
+| `ws://` | WebSocket | `ws` | one frame per text message, replies in request order; servers built with `ws` also accept a WebSocket handshake on their `tcp://` and `auto://` ports. The only transport of a client in a web page (wasm32), which reaches `tcp://` and `auto://` endpoints as `ws://` |
 
 Common rules:
 
@@ -514,6 +515,7 @@ Channel names: `<device>/<attribute>.<event_type in lower case>`, e.g.
 | ZeroMQ | one `PUB` socket per server (bound next to the ROUTER, port chosen by the system); the ZeroMQ topic is the channel name; message = `[channel, json Event]` |
 | gRPC | server-streaming `rpc Subscribe(SubscribeRequest{repeated string channels}) returns (stream EventFrame{bytes event})` on the same service |
 | Zenoh | the server puts each event on key `tango/event/<channel>` (e.g. `tango/event/sys/tg/1/ramp.change`); a client subscribes to `tango/event/**` on its own session and keeps its channels |
+| WebSocket | as TCP: a second WebSocket whose first message is `{"subscribe": [channel, …]}`, then one JSON `Event` per text message |
 
 Heartbeat events carry `{"Ok": "Heartbeat"}`. Every server-side transport
 forwards events through a bounded buffer per subscriber; a slow subscriber

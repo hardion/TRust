@@ -9,6 +9,7 @@
 //! | `0xFF`               | ZMTP greeting (ZeroMQ)         | spliced to an internal ROUTER  |
 //! | `PRI * HTTP/2.0`     | HTTP/2 preface (gRPC)          | handed to the tonic server     |
 //! | `len len 0x?1`       | Zenoh INIT after a u16 length  | spliced to an internal session |
+//! | `GET`                | WebSocket handshake            | the WebSocket transport        |
 //! | anything else        | unknown                        | closed                         |
 //!
 //! Client, `auto://host:port`: ZeroMQ and HTTP/2 servers greet first, so a short read on a
@@ -31,6 +32,7 @@ pub enum Wire {
     Zmtp,
     Http2,
     Zenoh,
+    WebSocket,
     Unknown,
 }
 
@@ -38,6 +40,7 @@ pub fn sniff(head: &[u8]) -> Wire {
     let json = head.iter().find(|b| !b" \t\r\n".contains(b));
     match head {
         [0xFF, ..] => Wire::Zmtp,
+        [b'G', b'E', b'T', ..] => Wire::WebSocket,
         [b'P', ..] if b"PRI * HTTP/2.0".starts_with(&head[..head.len().min(14)]) => Wire::Http2,
         // u16 little-endian frame length, then the INIT transport message (id 0x01)
         [_, _, header, ..] if header & 0x1F == 0x01 && json != Some(&b'{') => Wire::Zenoh,
@@ -124,6 +127,8 @@ impl Backends {
             Wire::Zmtp => splice(stream, self.zmq).await,
             #[cfg(feature = "zenoh")]
             Wire::Zenoh => splice(stream, self.zenoh).await,
+            #[cfg(feature = "ws")]
+            Wire::WebSocket => super::ws::serve_stream(stream, self.handler).await,
             #[allow(unreachable_patterns)]
             _ => {} // wire not compiled in: close
         }
@@ -168,6 +173,7 @@ mod tests {
         // Zenoh InitSyn as sent by the Rust (25 bytes) and Python (32 bytes = ' ') clients
         assert_eq!(sniff(b"\x19\x00\xc1\x09\xf2"), Wire::Zenoh);
         assert_eq!(sniff(b"\x20\x00\xc1\x09\xf2"), Wire::Zenoh, "length byte 0x20 is not JSON whitespace");
+        assert_eq!(sniff(b"GET / HTTP/1.1\r\n"), Wire::WebSocket);
         assert_eq!(sniff(b"POST /"), Wire::Unknown);
         assert_eq!(sniff(b""), Wire::Unknown);
     }

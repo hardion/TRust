@@ -93,7 +93,7 @@ of `docs/PLAN.md` §Phase 2), ⛔ out of scope (with reason).
 |---|---|
 | The 21 operations of the cheatsheet | ✅ |
 | Source DEV / CACHE / CACHE_DEV | ✅ |
-| Transports | ✅ TCP, ZeroMQ, gRPC, Zenoh (RFC-11 CORBA ⛔: replaced by design) |
+| Transports | ✅ TCP, ZeroMQ, gRPC, Zenoh, WebSocket (RFC-11 CORBA ⛔: replaced by design) |
 
 ## RFC-12 Publisher-Subscriber
 
@@ -103,7 +103,7 @@ of `docs/PLAN.md` §Phase 2), ⛔ out of scope (with reason).
 | Negotiation through admin commands, SUBSCRIPTION_INFO | ✅ |
 | Heartbeat every 9 s, confirmation within 600 s | ✅ (both configurable) |
 | Re-subscription, missed-event and overflow notification | ✅ |
-| Channels per transport (RFC-13 ZeroMQ and the others) | ✅ TCP, ZeroMQ PUB/SUB, gRPC streaming, Zenoh pub/sub |
+| Channels per transport (RFC-13 ZeroMQ and the others) | ✅ TCP, ZeroMQ PUB/SUB, gRPC streaming, Zenoh pub/sub, WebSocket |
 
 ## RFC-14 Logging
 
@@ -116,6 +116,6 @@ of `docs/PLAN.md` §Phase 2), ⛔ out of scope (with reason).
 | Item | Status |
 |---|---|
 | Starter device (`tango/admin/<host>`) | ✅ `apps/starter` (Unix-first: SIGKILL, `TANGO_HOST` for children) |
-| Device browser GUI with generic forms (egui) | ✅ `apps/browser` (WebAssembly build ⛔ until a WebSocket transport exists, BROWSER.md §6) |
+| Device browser GUI with generic forms (egui) | ✅ `apps/browser`, native and in a web page (wasm32, over WebSocket) |
 | Starter interface in the browser (Astor-like) | ✅ |
 | Access control (RFC-18), memorised attribute service (RFC-17), cache system (RFC-16) | ⛔ later phase |
