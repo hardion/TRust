@@ -138,6 +138,8 @@ Implemented as above, with these differences:
 * The web build (wasm32) runs the same app over WebSocket; `?db=host:port`
   picks the Database (default: the page's host, port 10000).
 
+  ![The browser in a web page (headless Chromium), a Demo device opened from its alias, after a write](browser-web.png)
+
 Tests: `form.rs` unit tests (widgets, texts, parsing with range errors, round
 trips, heat maps), `app.rs` unit tests (tree filter, Starter lines, property
 history), and two `egui_kittest` tests in `tests/ui.rs` against a live

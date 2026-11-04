@@ -53,3 +53,15 @@ pub async fn timeout<F: Future>(d: Duration, f: F) -> Option<F::Output> {
         futures_util::future::Either::Right(_) => None,
     }
 }
+
+/// This client's id in requests (locks, black box): the process id natively; in a web page,
+/// which has none, a random number drawn once per page.
+pub fn client_id() -> u64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    return std::process::id() as u64;
+    #[cfg(target_arch = "wasm32")]
+    {
+        static ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *ID.get_or_init(|| (js_sys::Math::random() * u32::MAX as f64) as u64 + 1)
+    }
+}

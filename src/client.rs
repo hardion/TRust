@@ -320,7 +320,7 @@ impl DeviceProxy {
 
     async fn send(&mut self, op: Op) -> DevResult<Data> {
         self.next_id += 1;
-        let (id, client, source, device) = (self.next_id, std::process::id() as u64, self.source, self.device.clone());
+        let (id, client, source, device) = (self.next_id, rt::client_id(), self.source, self.device.clone());
         let reply = self.link.call(Request { v: PROTOCOL_VERSION, id, client, source, device, op }).await?;
         if reply.id != id {
             return Err(bad_reply(reply));
