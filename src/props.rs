@@ -26,6 +26,7 @@ impl Properties {
         self.0.get(&name.to_lowercase())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     /// Resolves the declared properties from raw string lists (device > class > default).
     /// Returns the values, and the names of the missing mandatory properties.
     pub(crate) fn resolve(

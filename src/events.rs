@@ -3,13 +3,21 @@
 
 use crate::types::*;
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::{HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc};
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub const HEARTBEAT: Duration = Duration::from_secs(9);
+#[cfg(not(target_arch = "wasm32"))]
 pub const CONFIRM: Duration = Duration::from_secs(200);
 /// Events buffered per subscriber before the oldest are dropped (Tango `zmq_sub_event_hwm`).
 pub(crate) const BUFFER: usize = 1000;
@@ -91,6 +99,7 @@ pub struct Event {
     pub data: DevResult<EventData>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// `<device>/<name>.<type>`, or `<device>.interface_change`, in lower case.
 pub fn channel(device: &str, name: &str, t: EventType) -> String {
     match t {
@@ -100,11 +109,13 @@ pub fn channel(device: &str, name: &str, t: EventType) -> String {
     .to_lowercase()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn heartbeat_channel(admin: &str) -> String {
     format!("{}.heartbeat", admin.to_lowercase())
 }
 
 /// RFC-4 change rule between the value of the last event and a new one (SPEC §9.1).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn changed(
     old: &DevResult<AttrValue>,
     new: &DevResult<AttrValue>,
@@ -125,12 +136,14 @@ pub(crate) fn changed(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct Channel {
     seq: u64,
     subscribers: usize,
     confirmed: Instant,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// The server's publication point: every transport forwards what it broadcasts.
 pub(crate) struct Hub {
     tx: broadcast::Sender<Arc<Event>>,
@@ -169,6 +182,7 @@ impl LogLevel {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// The logging configuration of the server (RFC-14): per device a level and targets,
 /// `console::` or `file::<path>`.
 pub(crate) struct Logging {
@@ -176,12 +190,14 @@ pub(crate) struct Logging {
     pub(crate) devices: HashMap<String, (LogLevel, Vec<String>)>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Logging {
     pub(crate) fn device(&mut self, device: &str) -> &mut (LogLevel, Vec<String>) {
         self.devices.entry(device.to_lowercase()).or_default()
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Hub {
     pub(crate) fn new(heartbeat: Duration, confirm: Duration) -> Self {
         let (tx, _) = broadcast::channel(BUFFER);
@@ -295,6 +311,7 @@ impl Hub {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Handed to device code (`Device::attach`) to push events itself.
 #[derive(Clone)]
 pub struct EventSink {
@@ -302,6 +319,7 @@ pub struct EventSink {
     pub(crate) hub: Arc<Hub>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl EventSink {
     pub fn push(&self, name: &str, event_type: EventType, data: DevResult<EventData>) -> DevResult<()> {
         self.hub.publish(&channel(&self.device, name, event_type), event_type, data);
@@ -358,12 +376,11 @@ impl EventStream {
 }
 
 /// A callback subscription (`DeviceProxy::subscribe_event`); dropping it unsubscribes.
-pub struct Subscription(pub(crate) tokio::task::JoinHandle<()>);
+pub struct Subscription(pub(crate) crate::rt::AbortHandle);
 
 impl Subscription {
-    pub async fn unsubscribe(mut self) -> DevResult<()> {
+    pub async fn unsubscribe(self) -> DevResult<()> {
         self.0.abort();
-        let _ = (&mut self.0).await;
         Ok(())
     }
 }

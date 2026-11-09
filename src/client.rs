@@ -3,9 +3,10 @@
 use crate::db::{Database, database_endpoint, tango_host};
 use crate::events::{Event, EventData, EventStream, EventType, Sequence, Subscription};
 use crate::protocol::*;
+use crate::rt::{self, Instant};
 use crate::transport::{EventLink, Link};
 use crate::types::*;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub struct DeviceProxy {
     device: String,
@@ -44,8 +45,8 @@ impl Watch {
         let mut early = vec![];
         for _ in 0..100 {
             self.admin.command_inout("EventConfirmSubscription", self.confirm_args.clone()).await?;
-            let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
-            while let Ok(e) = tokio::time::timeout_at(deadline, link.next()).await {
+            let deadline = Instant::now() + Duration::from_millis(50);
+            while let Some(e) = rt::timeout(deadline.saturating_duration_since(Instant::now()), link.next()).await {
                 let e = e?;
                 if e.channel == self.beat {
                     self.link = Some(link);
@@ -74,9 +75,8 @@ impl Watch {
     /// Delivers events, watches heartbeats, confirms, re-subscribes; unsubscribes once the stream
     /// is dropped.
     async fn run(mut self, tx: tokio::sync::mpsc::Sender<Event>) {
-        let mut last_beat = tokio::time::Instant::now();
-        let mut confirm = tokio::time::interval(self.confirm);
-        confirm.tick().await;
+        let mut last_beat = Instant::now();
+        let mut next_confirm = Instant::now() + self.confirm;
         loop {
             let next = async {
                 match self.link.as_mut() {
@@ -84,30 +84,36 @@ impl Watch {
                     None => std::future::pending().await,
                 }
             };
+            let lost_at = last_beat + self.heartbeat * 3;
+            let wake = lost_at.min(next_confirm).saturating_duration_since(Instant::now());
             tokio::select! {
+                biased;
                 _ = tx.closed() => break,
                 e = next => match e {
-                    Ok(e) if e.channel == self.beat => last_beat = tokio::time::Instant::now(),
+                    Ok(e) if e.channel == self.beat => last_beat = Instant::now(),
                     Ok(e) => if !self.deliver(&tx, e).await { break },
                     Err(_) => self.link = None, // wait for the heartbeat timeout
                 },
-                _ = tokio::time::sleep_until(last_beat + self.heartbeat * 3) => {
-                    let lost = self.error("API_EventTimeout", format!("no heartbeat on {}", self.beat));
-                    if tx.send(lost).await.is_err() {
-                        break;
-                    }
-                    last_beat = tokio::time::Instant::now();
-                    self.link = None;
-                    if self.admin.command_inout("EventSubscriptionChange", self.subscribe.clone()).await.is_ok()
-                        && let Ok(early) = self.connect().await
-                    {
-                        for e in early {
-                            self.deliver(&tx, e).await;
+                _ = rt::sleep(wake) => {
+                    if Instant::now() >= lost_at {
+                        let lost = self.error("API_EventTimeout", format!("no heartbeat on {}", self.beat));
+                        if tx.send(lost).await.is_err() {
+                            break;
+                        }
+                        last_beat = Instant::now();
+                        self.link = None;
+                        if self.admin.command_inout("EventSubscriptionChange", self.subscribe.clone()).await.is_ok()
+                            && let Ok(early) = self.connect().await
+                        {
+                            for e in early {
+                                self.deliver(&tx, e).await;
+                            }
                         }
                     }
-                }
-                _ = confirm.tick() => {
-                    let _ = self.admin.command_inout("EventConfirmSubscription", self.confirm_args.clone()).await;
+                    if Instant::now() >= next_confirm {
+                        let _ = self.admin.command_inout("EventConfirmSubscription", self.confirm_args.clone()).await;
+                        next_confirm = Instant::now() + self.confirm;
+                    }
                 }
             }
         }
@@ -258,7 +264,7 @@ impl DeviceProxy {
         for e in early {
             sub.deliver(&tx, e).await;
         }
-        tokio::spawn(sub.run(tx));
+        rt::spawn(sub.run(tx));
         Ok(EventStream { rx })
     }
 
@@ -271,7 +277,7 @@ impl DeviceProxy {
         mut callback: impl FnMut(Event) + Send + 'static,
     ) -> DevResult<Subscription> {
         let mut events = self.event_stream(name, event_type).await?;
-        Ok(Subscription(tokio::spawn(async move {
+        Ok(Subscription(rt::spawn(async move {
             while let Some(e) = events.recv().await {
                 callback(e);
             }
@@ -314,7 +320,7 @@ impl DeviceProxy {
 
     async fn send(&mut self, op: Op) -> DevResult<Data> {
         self.next_id += 1;
-        let (id, client, source, device) = (self.next_id, std::process::id() as u64, self.source, self.device.clone());
+        let (id, client, source, device) = (self.next_id, rt::client_id(), self.source, self.device.clone());
         let reply = self.link.call(Request { v: PROTOCOL_VERSION, id, client, source, device, op }).await?;
         if reply.id != id {
             return Err(bad_reply(reply));

@@ -20,18 +20,35 @@ grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost", "dep:tokio-stream", "dep:to
 zenoh = ["dep:zenoh"]
 # one port for every enabled TCP based wire (server) and auto:// probing (client)
 detect = ["tcp"]
-full = ["tcp", "zmq", "grpc", "zenoh", "detect"]
+# WebSocket: ws:// endpoints, and WebSocket on tcp:// and auto:// ports; the only transport of
+# the wasm32 (web page) client
+ws = ["dep:tokio-tungstenite"]
+full = ["tcp", "zmq", "grpc", "zenoh", "detect", "ws"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["macros", "sync"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+# std::time that also works in a web page
+web-time = "1"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport", "ipc-transport"], optional = true }
 prost = { version = "0.14", optional = true }
 tokio-stream = { version = "0.1", features = ["net"], optional = true }
 tonic = { version = "0.14", optional = true }
 tonic-prost = { version = "0.14", optional = true }
 zenoh = { version = "1", default-features = false, features = ["transport_tcp", "transport_unixsock-stream"], optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "signal"] }
+tokio-tungstenite = { version = "0.30", optional = true }
+
+# the client in a web page: WebSocket and timers of the browser
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["WebSocket", "MessageEvent", "BinaryType"] }
 
 [build-dependencies]
 protoc-bin-vendored = { version = "3", optional = true }

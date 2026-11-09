@@ -25,6 +25,9 @@ over! {
     detected_zmq if all(feature = "detect", feature = "zmq"): "auto://127.0.0.1:{port}" => "zmq+tcp://127.0.0.1:{port}";
     detected_grpc if all(feature = "detect", feature = "grpc"): "auto://127.0.0.1:{port}" => "grpc://127.0.0.1:{port}";
     detected_zenoh if all(feature = "detect", feature = "zenoh"): "auto://127.0.0.1:{port}" => "zenoh://tcp/127.0.0.1:{port}";
+    ws if feature = "ws": "ws://127.0.0.1:{port}" => "ws://127.0.0.1:{port}";
+    tcp_as_ws if all(feature = "tcp", feature = "ws"): "tcp://127.0.0.1:{port}" => "ws://127.0.0.1:{port}";
+    detected_ws if all(feature = "detect", feature = "ws"): "auto://127.0.0.1:{port}" => "ws://127.0.0.1:{port}";
     probed_tcp if feature = "detect": "tcp://127.0.0.1:{port}" => "auto://127.0.0.1:{port}";
     probed_zmq if all(feature = "detect", feature = "zmq"): "zmq+tcp://127.0.0.1:{port}" => "auto://127.0.0.1:{port}";
     probed_grpc if all(feature = "detect", feature = "grpc"): "grpc://127.0.0.1:{port}" => "auto://127.0.0.1:{port}";

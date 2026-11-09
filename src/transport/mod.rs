@@ -5,14 +5,20 @@
 //! * **By URL**: the endpoint scheme selects the transport at run time.
 //! * **By detection of the wire** (`detect` feature): `auto://host:port` on the server accepts
 //!   every enabled TCP based wire on one port; on the client it probes the server's first bytes.
+//! * **In a web page** (wasm32): WebSocket only (`ws` feature); `tcp://` and `auto://` endpoints
+//!   are reached as `ws://`, which servers built with `ws` accept on those ports.
 
 use crate::events::Event;
 use crate::protocol::{Reply, Request};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::server::Handler;
 use crate::types::{DevFailed, DevResult};
 
-#[cfg(not(any(feature = "tcp", feature = "zmq", feature = "grpc", feature = "zenoh")))]
-compile_error!("enable at least one transport feature: tcp, zmq, grpc or zenoh");
+#[cfg(not(any(feature = "tcp", feature = "zmq", feature = "grpc", feature = "zenoh", feature = "ws")))]
+compile_error!("enable at least one transport feature: tcp, zmq, grpc, zenoh or ws");
+
+#[cfg(all(target_arch = "wasm32", not(feature = "ws")))]
+compile_error!("in a web page the only transport is WebSocket: enable the `ws` feature");
 
 #[cfg(feature = "detect")]
 pub(crate) mod detect;
@@ -20,6 +26,8 @@ pub(crate) mod detect;
 pub(crate) mod grpc;
 #[cfg(feature = "tcp")]
 pub(crate) mod tcp;
+#[cfg(feature = "ws")]
+pub(crate) mod ws;
 #[cfg(feature = "zenoh")]
 pub(crate) mod zenoh;
 #[cfg(feature = "zmq")]
@@ -38,6 +46,8 @@ pub enum Scheme {
     Zenoh,
     /// `auto://host:port`: wire detection.
     Auto,
+    /// `ws://host:port`: WebSocket.
+    Ws,
 }
 
 impl Scheme {
@@ -50,6 +60,7 @@ impl Scheme {
             "grpc" => (Self::Grpc, rest.into()),
             "zenoh" => (Self::Zenoh, rest.into()),
             "auto" => (Self::Auto, rest.into()),
+            "ws" => (Self::Ws, rest.into()),
             _ => {
                 return Err(DevFailed::new("API_UnsupportedTransport", format!("unknown scheme in {endpoint}"), "url"));
             }
@@ -66,6 +77,7 @@ impl Scheme {
             Self::Grpc => "grpc",
             Self::Zenoh => "zenoh",
             Self::Auto => "detect",
+            Self::Ws => "ws",
         }
     }
 
@@ -77,6 +89,7 @@ impl Scheme {
             Self::Grpc => cfg!(feature = "grpc"),
             Self::Zenoh => cfg!(feature = "zenoh"),
             Self::Auto => cfg!(feature = "detect"),
+            Self::Ws => cfg!(feature = "ws"),
         };
         if enabled {
             return Ok(());
@@ -87,6 +100,7 @@ impl Scheme {
 }
 
 /// An endpoint bound but not served yet.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) enum Listener {
     /// TCP based wires bind first so that port 0 resolves to the real port before export.
     #[allow(dead_code)] // without tcp, grpc and detect
@@ -97,14 +111,16 @@ pub(crate) enum Listener {
 }
 
 /// Binds an endpoint URL; returns the URL with the real port and the listener.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn listen(endpoint: &str) -> DevResult<(String, Listener)> {
     let (scheme, native) = Scheme::parse(endpoint)?;
     Ok(match scheme {
-        Scheme::Tcp | Scheme::Grpc | Scheme::Auto => {
+        Scheme::Tcp | Scheme::Grpc | Scheme::Auto | Scheme::Ws => {
             let listener = tokio::net::TcpListener::bind(&native).await?;
             let prefix = match scheme {
                 Scheme::Tcp => "tcp",
                 Scheme::Grpc => "grpc",
+                Scheme::Ws => "ws",
                 _ => "auto",
             };
             (format!("{prefix}://{}", listener.local_addr()?), Listener::Tcp(scheme, listener))
@@ -114,6 +130,7 @@ pub(crate) async fn listen(endpoint: &str) -> DevResult<(String, Listener)> {
 }
 
 /// Serves `handler` on a bound endpoint forever.
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(unused_variables)]
 pub(crate) async fn serve(listener: Listener, handler: Handler) -> DevResult<()> {
     match listener {
@@ -123,6 +140,8 @@ pub(crate) async fn serve(listener: Listener, handler: Handler) -> DevResult<()>
         Listener::Tcp(Scheme::Grpc, l) => grpc::serve(l, handler).await,
         #[cfg(feature = "detect")]
         Listener::Tcp(Scheme::Auto, l) => detect::serve(l, handler).await,
+        #[cfg(feature = "ws")]
+        Listener::Tcp(Scheme::Ws, l) => ws::serve(l, handler).await,
         #[cfg(feature = "zmq")]
         Listener::Later(Scheme::Zmq, native) => zmq::serve(&native, handler).await,
         #[cfg(feature = "zenoh")]
@@ -135,6 +154,7 @@ pub(crate) async fn serve(listener: Listener, handler: Handler) -> DevResult<()>
 }
 
 /// The server's events for which `keep` holds, until the server stops or the receiver is dropped.
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)] // without a transport
 pub(crate) fn events(
     handler: Handler,
@@ -159,6 +179,9 @@ pub(crate) fn events(
 
 /// The concrete endpoint URL: `auto://` is probed into a transport scheme.
 pub(crate) async fn resolve(endpoint: &str) -> DevResult<String> {
+    #[cfg(target_arch = "wasm32")]
+    return Ok(browser_endpoint(endpoint));
+    #[cfg_attr(target_arch = "wasm32", allow(unreachable_code))]
     let (scheme, native) = Scheme::parse(endpoint)?;
     #[cfg(feature = "detect")]
     if scheme == Scheme::Auto {
@@ -166,6 +189,17 @@ pub(crate) async fn resolve(endpoint: &str) -> DevResult<String> {
     }
     let _ = (scheme, native);
     Ok(endpoint.to_string())
+}
+
+/// A web page only has WebSocket: `tcp://` and `auto://` endpoints (and bare `host:port`) are
+/// reached as `ws://` on the same port.
+#[cfg(target_arch = "wasm32")]
+fn browser_endpoint(endpoint: &str) -> String {
+    match endpoint.split_once("://") {
+        Some(("tcp" | "auto", rest)) => format!("ws://{rest}"),
+        None => format!("ws://{endpoint}"),
+        _ => endpoint.to_string(),
+    }
 }
 
 /// The client side of an event subscription, on the transport of `url` (SPEC §9.2).
@@ -178,6 +212,8 @@ pub(crate) enum EventLink {
     Grpc(grpc::EventLink),
     #[cfg(feature = "zenoh")]
     Zenoh(zenoh::EventLink),
+    #[cfg(feature = "ws")]
+    Ws(ws::EventLink),
 }
 
 impl EventLink {
@@ -194,6 +230,8 @@ impl EventLink {
             Scheme::Grpc => Self::Grpc(grpc::EventLink::connect(&native, channels).await?),
             #[cfg(feature = "zenoh")]
             Scheme::Zenoh => Self::Zenoh(zenoh::EventLink::connect(&native, channels).await?),
+            #[cfg(feature = "ws")]
+            Scheme::Ws => Self::Ws(ws::EventLink::connect(&native, &channels).await?),
             #[allow(unreachable_patterns)]
             _ => unreachable!("resolved and checked by Scheme::parse"),
         })
@@ -210,6 +248,8 @@ impl EventLink {
             Self::Grpc(l) => l.next().await,
             #[cfg(feature = "zenoh")]
             Self::Zenoh(l) => l.next().await,
+            #[cfg(feature = "ws")]
+            Self::Ws(l) => l.next().await,
         }
     }
 }
@@ -224,6 +264,8 @@ pub(crate) enum Link {
     Grpc(grpc::Link),
     #[cfg(feature = "zenoh")]
     Zenoh(zenoh::Link),
+    #[cfg(feature = "ws")]
+    Ws(ws::Link),
 }
 
 impl Link {
@@ -242,6 +284,8 @@ impl Link {
             Scheme::Grpc => Self::Grpc(grpc::Link::connect(&native).await?),
             #[cfg(feature = "zenoh")]
             Scheme::Zenoh => Self::Zenoh(zenoh::Link::connect(&native, device).await?),
+            #[cfg(feature = "ws")]
+            Scheme::Ws => Self::Ws(ws::Link::connect(&native).await?),
             #[allow(unreachable_patterns)]
             _ => unreachable!("checked by Scheme::parse, a probe never answers auto"),
         })
@@ -262,6 +306,8 @@ impl Link {
             Self::Zmq(l) => l.call(frame).await?,
             #[cfg(feature = "zenoh")]
             Self::Zenoh(l) => l.call(frame).await?,
+            #[cfg(feature = "ws")]
+            Self::Ws(l) => l.call(frame).await?,
             #[allow(unreachable_patterns)]
             _ => unreachable!("handled above"),
         };
@@ -287,6 +333,9 @@ mod tests {
         if cfg!(feature = "zmq") {
             assert_eq!(p("zmq+tcp://h:1"), Ok((Scheme::Zmq, "tcp://h:1".into())));
             assert_eq!(p("zmq+ipc:///tmp/s"), Ok((Scheme::Zmq, "ipc:///tmp/s".into())));
+        }
+        if cfg!(feature = "ws") {
+            assert_eq!(p("ws://h:1"), Ok((Scheme::Ws, "h:1".into())));
         }
         if cfg!(feature = "zenoh") {
             assert_eq!(p("zenoh://tcp/h:1"), Ok((Scheme::Zenoh, "tcp/h:1".into())));

@@ -26,6 +26,7 @@ by detection of the wire (one `auto://` port for every wire, client-side probing
 | `grpc` | gRPC (tonic, vendored protoc) | `grpc://host:50051/sys/tg/1` |
 | `zenoh` | Zenoh | `zenoh://tcp/host:7447/sys/tg/1`, `zenoh:///sys/tg/1` (discovery) |
 | `detect` | wire detection | `auto://host:10000/sys/tg/1` |
+| `ws` | WebSocket (also accepted on `tcp://` and `auto://` ports); the transport of the browser in a web page | `ws://host:10000/sys/tg/1` |
 | `full` | all of the above | |
 
 ```sh
