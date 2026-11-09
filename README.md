@@ -1,5 +1,5 @@
 # TRust
-PoC for new control system
+PoC for new control system, fully generate with AI
 
 A minimal Rust implementation of the [Tango Controls](https://www.tango-controls.org) device model
 (Tango RFC-2/3/4/7/9) whose request-reply protocol (RFC-10) runs over **pluggable transports**:
